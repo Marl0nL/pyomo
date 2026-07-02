@@ -101,8 +101,8 @@ def check_single_segment_no_disjunction(test, transformation, m=None):
     # Nor should it have introduced any new Vars (such as a substitute_var
     # or an indicator_var)--m.x should be the only Var in the model.
     model_vars = list(m.component_data_objects(Var))
-    test.assertEqual(len(model_vars)), 1)
-    self.assertIs(model_vars[0], m.x)
+    test.assertEqual(len(model_vars), 1)
+    test.assertIs(model_vars[0], m.x)
 
     z = m.pw_log.get_transformation_var(m.log_expr)
     test.assertIsInstance(z, Expression)
