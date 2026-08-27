@@ -177,13 +177,19 @@ class FastLoadCompiled:
         return self.hessian is not None and self.hessian.nnz > 0
 
 
-def compile_to_highs_arrays(model):
-    """Compile a classic linear ``model`` to HiGHS-ready range-row arrays.
+def compile_to_highs_arrays(model, solver_name=None):
+    """Compile a classic linear ``model`` to solver-ready range-row arrays.
 
     Reuses the stock :class:`LinearStandardFormCompiler` (mixed form: equalities
     kept as equalities, one-sided rows kept one-sided) -- the fast, single-pass
     matrix compile that the Phase-0 harness measured -- and converts its
-    ``(constraint, multiplier)`` rows into HiGHS range rows.
+    ``(constraint, multiplier)`` rows into range rows.
+
+    The result (:class:`FastLoadCompiled`) is solver-neutral: it carries no HiGHS
+    specifics, so a second backend (e.g. :class:`FastLoadGurobi`) reuses it
+    verbatim.  ``solver_name`` only labels the fail-loud error messages (which
+    name the solver whose scope guard rejected the model); it defaults to the
+    HiGHS fast solver's name.
 
     Raises :class:`IncompatibleModelError` if the model is not linear or contains
     components the standard-form compiler cannot process; the message points at
@@ -196,6 +202,9 @@ def compile_to_highs_arrays(model):
     per-row repn, over one shared column space -- construction and load both stay
     array-shaped end-to-end (Phase-3).
     """
+    if solver_name is None:
+        solver_name = FastLoadHighs.name
+
     from pyomo.contrib.vector.template_vectorize import (
         model_has_templates,
         compile_templated_to_highs_arrays,
@@ -211,7 +220,7 @@ def compile_to_highs_arrays(model):
     # the same column space (the #1761 use case, objective-quadratic only).
     quad = _quadratic_objective_repn(model)
     if quad is not None:
-        return _compile_quadratic_objective(model, *quad)
+        return _compile_quadratic_objective(model, *quad, solver_name=solver_name)
 
     from pyomo.repn.plugins.standard_form import LinearStandardFormCompiler
     from pyomo.common.errors import InvalidConstraintError, InvalidExpressionError
@@ -224,7 +233,7 @@ def compile_to_highs_arrays(model):
         )
     except (InvalidConstraintError, InvalidExpressionError) as e:
         raise IncompatibleModelError(
-            f"The '{FastLoadHighs.name}' fast solver hand-off only supports "
+            f"The '{solver_name}' fast solver hand-off only supports "
             "linear models; this model has nonlinear terms that the standard-form "
             f"compiler cannot process ({e}).  Use a classic nonlinear solver "
             "route (e.g. SolverFactory('ipopt'))."
@@ -233,13 +242,13 @@ def compile_to_highs_arrays(model):
         # categorize_valid_components raises ValueError listing components the
         # standard-form compiler does not understand (e.g. Piecewise, SOS).
         raise IncompatibleModelError(
-            f"The '{FastLoadHighs.name}' fast solver hand-off cannot compile this "
+            f"The '{solver_name}' fast solver hand-off cannot compile this "
             f"model to linear standard form: {e}  Use a classic solver route."
         ) from e
 
     if len(info.objectives) > 1:
         raise IncompatibleModelError(
-            f"The '{FastLoadHighs.name}' fast solver hand-off supports at most one "
+            f"The '{solver_name}' fast solver hand-off supports at most one "
             f"objective (received {len(info.objectives)})."
         )
 
@@ -296,6 +305,17 @@ def compile_to_highs_arrays(model):
     )
 
 
+# Solver-neutral seam.  ``compile_to_highs_arrays`` produces a
+# :class:`FastLoadCompiled` -- standard-form range-row arrays (A, row/col bounds,
+# integrality, linear cost + optional objective Hessian) with *no* HiGHS
+# specifics: the HiGHS-only step is :func:`build_highs_model`, which turns those
+# arrays into ``highspy`` objects.  A second solver backend reuses the compile
+# verbatim and supplies its own array->solver builder (e.g.
+# :mod:`pyomo.contrib.vector.gurobi_fastload`), so this alias names the seam
+# without renaming the original (which the HiGHS routes and tests import).
+compile_fastload_arrays = compile_to_highs_arrays
+
+
 def _quadratic_objective_repn(model):
     """Return ``(obj, qrepn)`` if the single active objective is quadratic, else
     ``None``.
@@ -321,15 +341,19 @@ def _quadratic_objective_repn(model):
     return obj, qrepn
 
 
-def _compile_quadratic_objective(model, obj, qrepn):
+def _compile_quadratic_objective(model, obj, qrepn, solver_name=None):
     """Compile a model whose objective is convex-quadratic (constraints linear).
 
     The constraints and their column space come from the stock
     :class:`LinearStandardFormCompiler` (the objective set aside so it does not
     reject the quadratic term); the objective's linear cost and Hessian are then
     added over that same column space, extended with any objective-only
-    variables the constraints did not already contribute.
+    variables the constraints did not already contribute.  ``solver_name`` labels
+    the fail-loud error messages (defaults to the HiGHS fast solver's name).
     """
+    if solver_name is None:
+        solver_name = FastLoadHighs.name
+
     from pyomo.common.dependencies import scipy
     from pyomo.repn.plugins.standard_form import LinearStandardFormCompiler
     from pyomo.common.errors import InvalidConstraintError, InvalidExpressionError
@@ -343,14 +367,14 @@ def _compile_quadratic_objective(model, obj, qrepn):
         )
     except (InvalidConstraintError, InvalidExpressionError) as e:
         raise IncompatibleModelError(
-            f"The '{FastLoadHighs.name}' fast solver hand-off supports a quadratic "
+            f"The '{solver_name}' fast solver hand-off supports a quadratic "
             "objective only with linear constraints; this model has a nonlinear "
             f"constraint the standard-form compiler cannot process ({e}).  Use a "
             "classic nonlinear solver route (e.g. SolverFactory('ipopt'))."
         ) from e
     except ValueError as e:
         raise IncompatibleModelError(
-            f"The '{FastLoadHighs.name}' fast solver hand-off cannot compile this "
+            f"The '{solver_name}' fast solver hand-off cannot compile this "
             f"model to standard form: {e}  Use a classic solver route."
         ) from e
     finally:

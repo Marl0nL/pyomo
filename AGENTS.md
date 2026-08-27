@@ -26,6 +26,19 @@ quadratic constraints, MIQP, and non-convex QP fail loud (HiGHS solves convex QP
 only). See `bench/QUADRATIC_QP_REPORT.md`. CI on the fork is manual-trigger-only —
 validate locally.
 
+**Solver backends.** The cold hand-off has two backends over one solver-neutral
+compile: `compile_to_highs_arrays` (alias `compile_fastload_arrays`) emits a
+solver-agnostic `FastLoadCompiled` (standard-form range-row arrays); each backend
+supplies only an array→solver builder + map-back. `highs_fastload` (`fastload.py`,
+`build_highs_model`) and `gurobi_fastload` (`gurobi_fastload.py`, gurobipy's
+`addMVar`/`addMConstr`/`setMObjective` matrix API) share scope: linear + convex-QP
+objective; non-convex/MIQP/quadratic-constraint fail loud. When adding a backend,
+reuse the compile and pass `solver_name=` so fail-loud messages name it. See
+`bench/GUROBI_FASTLOAD_REPORT.md`. **gurobipy license note:** the pip wheel is
+size-limited to **2000 vars/2000 cons** (errno 10010) — all Gurobi tests/benches
+stay under it and *skip* when gurobipy/license absent; no large-scale claim is
+locally measurable. Deferred: `gurobi_faststep` (warm) and convex-MIQP.
+
 - Benchmarks run in a machine-local venv `bench/.venv` (recreate per `bench/README.md`);
   run cold-stage benches via `bench/run_bench.py`, the warm-tick bench via
   `python -m bench.warm_faststep`.

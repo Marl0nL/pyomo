@@ -77,9 +77,14 @@ from pyomo.contrib.vector.highs import (
 from pyomo.contrib.vector.fastload import (
     FastLoadHighs,
     compile_to_highs_arrays,
+    compile_fastload_arrays,
     build_highs_lp,
     build_highs_model,
 )
+
+# The Gurobi twin of ``highs_fastload``: same solver-neutral compile, handed to
+# Gurobi's native matrix API (registers ``gurobi_fastload``).
+from pyomo.contrib.vector.gurobi_fastload import FastLoadGurobi
 
 # Phase 4 -- array-native persistent warm re-solve for the rolling-horizon path.
 from pyomo.contrib.vector.faststep import FastStepHighs
@@ -118,8 +123,10 @@ __all__ = [
     'QuadraticModelError',
     'FastLoadHighs',
     'compile_to_highs_arrays',
+    'compile_fastload_arrays',
     'build_highs_lp',
     'build_highs_model',
+    'FastLoadGurobi',
     'FastStepHighs',
     'vectorized_construction',
     'templatize_enabled_by_env',
