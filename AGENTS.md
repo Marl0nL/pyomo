@@ -12,7 +12,10 @@ This fork carries a phased "Vectorized Model Construction for Pyomo" program und
 relevant one before touching a phase. Phases: 1 columnar components, 2
 `highs_fastload` (cold `passModel` hand-off), 3 template construction, 4
 `highs_faststep` (`FastStepHighs`, array-native persistent **warm** re-solve for
-rolling-horizon / MPC). CI on the fork is manual-trigger-only — validate locally.
+rolling-horizon / MPC). `highs_faststep` accepts mutable constraint-matrix
+coefficients via a value-aware guard (verify the values each roll, not the
+mutability flag) — see `bench/VALUEGUARD_REPORT.md`. CI on the fork is
+manual-trigger-only — validate locally.
 
 - Benchmarks run in a machine-local venv `bench/.venv` (recreate per `bench/README.md`);
   run cold-stage benches via `bench/run_bench.py`, the warm-tick bench via

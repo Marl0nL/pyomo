@@ -174,7 +174,12 @@ the affected rows/columns are recomputed and pushed).
   notes durations/efficiencies are constant on an equal-interval roll), and
   supporting in-place `A` edits would add a per-coefficient path the batch design
   exists to avoid. Mutable matrix coefficients are rejected loudly rather than
-  silently ignored.
+  silently ignored. **Update:** the *rejection* was since replaced by a
+  **value-aware static-matrix guard** — a nominally-mutable matrix coefficient
+  whose value never changes is now accepted and warm-solved, and a genuine change
+  fails loud (or, opt-in, reloads); see `bench/VALUEGUARD_REPORT.md`. In-place
+  batched `A` *edits* remain deferred (the guard detects change; it does not yet
+  apply it).
 * **Finer dirty-set evaluation.** The `dirty` mask currently recomputes the full
   value of every *affected* row (any row touched by a changed parameter) and
   pushes those; it does not yet compute per-entry deltas. For the target pattern

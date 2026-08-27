@@ -1,0 +1,47 @@
+{
+  "model": "rolling_mpc",
+  "rows": [
+    {
+      "size": "1e4",
+      "A": 12,
+      "T": 220,
+      "n_col": 5280,
+      "n_row": 2860,
+      "nnz": 10548,
+      "rolls": 30,
+      "appsi_persistent_ms": 53.680339944548905,
+      "faststep_model_ms": 15.392573492135853,
+      "faststep_array_ms": 14.927744050510228,
+      "faststep_valueguard_ms": 15.88941301451996,
+      "guard_check_ms": 0.03367493627592921,
+      "guard_overhead_frac": 0.002119331673558778,
+      "valueguard_vs_static": 1.0322778723543498,
+      "n_guarded_coeffs": 2640,
+      "speedup_model": 3.487418135243887,
+      "speedup_array": 3.596011544873327,
+      "max_obj_deviation": 7.836028471746883e-15,
+      "equivalent": true
+    },
+    {
+      "size": "1e5",
+      "A": 40,
+      "T": 640,
+      "n_col": 51200,
+      "n_row": 26240,
+      "nnz": 102360,
+      "rolls": 30,
+      "appsi_persistent_ms": 687.281625054311,
+      "faststep_model_ms": 294.4924755138345,
+      "faststep_array_ms": 289.8612524732016,
+      "faststep_valueguard_ms": 296.21596296783537,
+      "guard_check_ms": 0.19489496480673552,
+      "guard_overhead_frac": 0.0006579488926054205,
+      "valueguard_vs_static": 1.0058523989483728,
+      "n_guarded_coeffs": 25600,
+      "speedup_model": 2.3337833126470637,
+      "speedup_array": 2.3710710527542895,
+      "max_obj_deviation": 2.3245468067076118e-14,
+      "equivalent": true
+    }
+  ]
+}
