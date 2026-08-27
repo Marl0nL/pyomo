@@ -39,10 +39,28 @@ size-limited to **2000 vars/2000 cons** (errno 10010) — all Gurobi tests/bench
 stay under it and *skip* when gurobipy/license absent; no large-scale claim is
 locally measurable. Deferred: `gurobi_faststep` (warm) and convex-MIQP.
 
-- Benchmarks run in a machine-local venv `bench/.venv` (recreate per `bench/README.md`);
-  run cold-stage benches via `bench/run_bench.py`, the warm-tick bench via
-  `python -m bench.warm_faststep`.
-- Tests: `pytest pyomo/contrib/vector/tests/`.
+**Phase-2 mutability (real ragged/mutating models).** The columnar components are
+mutable in bulk (position-space `where=`) and per-element (materialized view):
+`VectorVar.setlb/setub/set_bounds/fix/unfix/set_values`,
+`VectorConstraint.deactivate_rows/activate_rows/set_row_active/set_row_bounds`.
+Masked-out rows are *dropped* from the one-shot standard form (matching classic
+`deactivate()`) and *relaxed* on the solve path; fixed vars substitute out in
+`compile_standard_form` / pin as column bounds in the HiGHS hand-off. Each mutation
+records dirty columns/rows; `VectorPersistentHighs` (`persistent.py`) loads once and
+warm re-solves by pushing only the dirty subset through HiGHS
+`changeColsBounds`/`changeRowsBounds` (basis retained), with a fail-loud structural
+guard and array-native solution load-back (`load_solution`, `VectorVar.value_array`).
+The ragged `supply_chain` runs the full vector fast path via
+`bench/models/supply_chain_vector.py` (register new vector models in
+`run_bench._vector_models`); note the `supply_chain` *generator* is infeasible at
+1e5+ (a pre-existing data property — the classic build is equally infeasible).
+
+- Benchmarks run in a machine-local venv `bench/.venv` (recreate per `bench/README.md`;
+  needs numpy/scipy/highspy, gurobipy optional). Cold-stage + vector-path benches via
+  `bench/run_bench.py` (`--backends pyomo,pyomo_vector`), the warm-tick bench via
+  `python -m bench.warm_faststep`, the mutation-cycle bench via `python -m bench.mutation_cycle`.
+- Tests: `pytest pyomo/contrib/vector/tests/` (mutation: `test_mutation.py`,
+  sparse/ragged index: `test_sparse.py`).
 
 ## Maintaining this file
 

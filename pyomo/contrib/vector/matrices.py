@@ -71,7 +71,7 @@ class VectorMatrices:
 
     def __init__(self, n_var, col_lower, col_upper, integrality, col_value,
                  col_fixed, A, row_lower, row_upper, c, c_offset, sense,
-                 var_blocks, row_blocks, hessian=None):
+                 var_blocks, row_blocks, hessian=None, row_active=None):
         self.n_var = n_var
         self.col_lower = col_lower
         self.col_upper = col_upper
@@ -81,6 +81,13 @@ class VectorMatrices:
         self.A = A
         self.row_lower = row_lower
         self.row_upper = row_upper
+        # Per-row active mask (masked deactivation): True == enforced.  A
+        # deactivated row is dropped by ``compile_standard_form`` (to match a
+        # classic ``deactivate()``) and relaxed to (-inf,+inf) by the HiGHS
+        # hand-off.  None == "all rows active".
+        if row_active is None:
+            row_active = np.ones(A.shape[0], dtype=bool)
+        self.row_active = row_active
         self.c = c
         self.c_offset = c_offset
         self.sense = sense
@@ -197,7 +204,7 @@ def assemble(model):
 
     # --- constraint matrix (stack, remapping local -> global columns) --- #
     data_parts, indices_parts, indptr = [], [], [0]
-    row_lower_parts, row_upper_parts, row_blocks = [], [], []
+    row_lower_parts, row_upper_parts, row_active_parts, row_blocks = [], [], [], []
     roff = 0
     for con in vcons:
         A = con.A
@@ -214,6 +221,7 @@ def assemble(model):
         indptr.extend((A.indptr[1:] + indptr[-1]).tolist())
         row_lower_parts.append(con.row_lb)
         row_upper_parts.append(con.row_ub)
+        row_active_parts.append(con.row_active)
         row_blocks.append((con, roff, con.nrows))
         roff += con.nrows
     n_row = roff
@@ -224,10 +232,12 @@ def assemble(model):
         A = scipy.sparse.csr_array((data, indices, indptr), shape=(n_row, n_var))
         row_lower = np.concatenate(row_lower_parts)
         row_upper = np.concatenate(row_upper_parts)
+        row_active = np.concatenate(row_active_parts)
     else:
         A = scipy.sparse.csr_array((n_row, n_var))
         row_lower = np.zeros(0)
         row_upper = np.zeros(0)
+        row_active = np.ones(0, dtype=bool)
 
     # --- objective ------------------------------------------------------ #
     c = np.zeros(n_var, dtype=np.float64)
@@ -249,7 +259,7 @@ def assemble(model):
     return VectorMatrices(
         n_var, col_lower, col_upper, integrality, col_value, col_fixed,
         A, row_lower, row_upper, c, c_offset, sense, var_blocks, row_blocks,
-        hessian,
+        hessian, row_active,
     )
 
 
@@ -364,20 +374,25 @@ def compile_standard_form(model, mixed_form=True, set_sense=ObjectiveSense.minim
     A = Acsc[:, keep_cols].tocsr()
     c_keep = mx.c[keep_cols]
 
+    # Masked-out (deactivated) rows are dropped entirely, matching a classic
+    # ``con[r].deactivate()`` (the row disappears from the standard form).
+    active = mx.row_active
+
     # After substitution/elimination, a row can be empty because it was
     # structurally empty OR because every one of its variables was fixed.  Both
     # are "constant constraints": drop them if feasible (body == 0), raise if
     # trivially infeasible -- exactly as the stock compiler does at repn time.
+    # An empty row that is masked off never raises (it is not enforced).
     row_nnz = np.diff(A.indptr)
     empty = row_nnz == 0
-    infeasible = empty & ((row_lb > 0.0) | (row_ub < 0.0))
+    infeasible = empty & active & ((row_lb > 0.0) | (row_ub < 0.0))
     if infeasible.any():
         gi = int(np.nonzero(infeasible)[0][0])
         con, lr = mx.row_con_and_local(gi)
         raise InfeasibleConstraintException(
             f"model contains a trivially infeasible constraint, '{con.name}[{lr}]'"
         )
-    keep_row = ~empty
+    keep_row = ~empty & active
     global_row_idx = np.nonzero(keep_row)[0]
     A = A[keep_row]
     row_lb = row_lb[keep_row]

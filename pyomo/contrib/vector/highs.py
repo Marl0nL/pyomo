@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from pyomo.common.dependencies import numpy as np, scipy
 
-from pyomo.contrib.vector.matrices import assemble, VectorMatrices
+from pyomo.contrib.vector.matrices import assemble, VectorMatrices, _collect
 
 
 def matrices_to_highs_lp(mx: VectorMatrices):
@@ -44,8 +44,15 @@ def matrices_to_highs_lp(mx: VectorMatrices):
     col_lower = np.where(np.isneginf(col_lower), -inf, col_lower)
     col_upper = np.where(np.isposinf(col_upper), inf, col_upper)
 
-    row_lower = np.where(np.isneginf(mx.row_lower), -inf, mx.row_lower).astype(np.float64)
-    row_upper = np.where(np.isposinf(mx.row_upper), inf, mx.row_upper).astype(np.float64)
+    r_lower = mx.row_lower
+    r_upper = mx.row_upper
+    # Masked-out (deactivated) rows are relaxed to (-inf, +inf): vacuous, never
+    # binding -- the persistent-path equivalent of dropping the row.
+    if not mx.row_active.all():
+        r_lower = np.where(mx.row_active, r_lower, -np.inf)
+        r_upper = np.where(mx.row_active, r_upper, np.inf)
+    row_lower = np.where(np.isneginf(r_lower), -inf, r_lower).astype(np.float64)
+    row_upper = np.where(np.isposinf(r_upper), inf, r_upper).astype(np.float64)
 
     A = mx.A.tocsc()
 
@@ -147,8 +154,36 @@ def load_highs(model):
     return h
 
 
-def solve_highs(model):
+def load_solution(model, highs):
+    """Scatter a solved HiGHS solution back into the model's VectorVar arrays.
+
+    The array-native read path (scoping doc Phase 2): the primal ``col_value``
+    vector is split by the same column blocks :func:`assemble` uses and written
+    straight into each :class:`~pyomo.contrib.vector.var.VectorVar`'s value
+    array in bulk -- ``m.x.value_array`` (and ``m.x[i].value``) then read the
+    solution with no per-index solver query.  Returns the number of columns
+    loaded.
+    """
+    vvars, _, _ = _collect(model)
+    col_value = np.array(highs.getSolution().col_value, dtype=np.float64)
+    off = 0
+    for v in vvars:
+        n = v.n
+        v._value_arr[:] = col_value[off:off + n]
+        off += n
+    return off
+
+
+def info_has_feasible(highs):
+    """True when HiGHS holds a feasible primal solution to read back."""
+    return highs.getInfo().primal_solution_status == 2
+
+
+def solve_highs(model, load_solutions=False):
     """Convenience: assemble, load, and solve; returns ``(highs, objective)``.
+
+    With ``load_solutions=True`` the primal solution is scattered back into the
+    model's VectorVar value arrays (:func:`load_solution`).
 
     A non-convex QP is surfaced clearly: HiGHS refuses a non-PSD Hessian at
     ``run`` time, which this reports rather than returning a bogus objective.
@@ -169,5 +204,7 @@ def solve_highs(model):
             "only): for a minimize objective the Hessian must be positive "
             "semidefinite (negative semidefinite for maximize)."
         )
+    if load_solutions and info_has_feasible(h):
+        load_solution(model, h)
     info = h.getInfo()
     return h, info.objective_function_value

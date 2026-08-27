@@ -105,6 +105,15 @@ class VectorConstraint(ActiveIndexedComponent):
         self._user_index = self._index_set is not UnindexedComponent_set
         self._scalarized = False
         self._scalarizing = False
+        # Per-row active mask (masked deactivation, Phase-2).  True == the row is
+        # enforced.  A deactivated row is *removed* from the one-shot standard
+        # form (matching classic ``con[r].deactivate()``) and *relaxed* to
+        # (-inf, +inf) on the persistent solve path (cheap, warm-basis friendly).
+        self._row_active = None
+        # Dirty-row tracking for the persistent (warm) re-solve path: positions
+        # whose effective row bounds (RHS or active flag) changed since the last
+        # ``pop_dirty_rows``.  ``None`` == "all dirty".
+        self._dirty_rows = None
 
     # ------------------------------------------------------------------ #
     # Construction
@@ -141,6 +150,7 @@ class VectorConstraint(ActiveIndexedComponent):
 
         n = self._nrows
         self._row_lb, self._row_ub = self._normalize_bounds(n)
+        self._row_active = np.ones(n, dtype=bool)
 
         if not self._user_index:
             from pyomo.core.base.set import RangeSet
@@ -199,6 +209,121 @@ class VectorConstraint(ActiveIndexedComponent):
     @property
     def col_split(self):
         return self._col_split
+
+    @property
+    def row_active(self):
+        return self._row_active
+
+    def effective_row_bounds(self):
+        """Return ``(lb, ub)`` with deactivated rows relaxed to ``(-inf, +inf)``.
+
+        This is the solve-path view of the row mask: a masked-out row becomes
+        vacuous (never binding), which is the persistent-path equivalent of the
+        one-shot standard form dropping the row entirely.
+        """
+        if self._row_active.all():
+            return self._row_lb, self._row_ub
+        lb = np.where(self._row_active, self._row_lb, _ninf)
+        ub = np.where(self._row_active, self._row_ub, _inf)
+        return lb, ub
+
+    # ------------------------------------------------------------------ #
+    # Masked deactivation + RHS mutation + dirty tracking (Phase-2)
+    # ------------------------------------------------------------------ #
+    def _resolve_rows(self, where):
+        """Normalize a ``where=`` row selector to an int position array (None=all)."""
+        if where is None:
+            return None
+        arr = np.asarray(where)
+        if arr.dtype == bool:
+            if arr.shape != (self._nrows,):
+                raise ValueError(
+                    f"VectorConstraint '{self.name}': boolean 'where' mask has "
+                    f"shape {arr.shape}, expected ({self._nrows},)."
+                )
+            return np.nonzero(arr)[0]
+        return arr.astype(np.int64, copy=False).ravel()
+
+    def _mark_rows_dirty(self, positions):
+        if positions is None:
+            self._dirty_rows = None
+        elif self._dirty_rows is not None:
+            self._dirty_rows.update(int(p) for p in positions)
+
+    def deactivate_rows(self, where):
+        """Mask off (deactivate) the selected rows; marks them dirty."""
+        pos = self._resolve_rows(where)
+        if pos is None:
+            self._row_active[:] = False
+        else:
+            self._row_active[pos] = False
+        self._mark_rows_dirty(pos)
+
+    def activate_rows(self, where=None):
+        """Re-activate the selected rows (default all); marks them dirty."""
+        pos = self._resolve_rows(where)
+        if pos is None:
+            self._row_active[:] = True
+        else:
+            self._row_active[pos] = True
+        self._mark_rows_dirty(pos)
+
+    def set_row_active(self, mask):
+        """Set the whole active mask from a length-nrows boolean array."""
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != (self._nrows,):
+            raise ValueError(
+                f"VectorConstraint '{self.name}': active mask has shape "
+                f"{mask.shape}, expected ({self._nrows},)."
+            )
+        changed = np.nonzero(mask != self._row_active)[0]
+        self._row_active = mask.copy()
+        self._mark_rows_dirty(changed)
+
+    def set_row_bounds(self, lb=NOTSET, ub=NOTSET, where=None):
+        """Bulk-mutate row lower/upper bounds (RHS); marks rows dirty.
+
+        ``lb``/``ub`` are scalars (broadcast) or arrays over the selection;
+        ``None`` means unbounded on that side.  Pass only the side(s) to change.
+        """
+        pos = self._resolve_rows(where)
+        count = self._nrows if pos is None else len(pos)
+
+        def _vals(val):
+            arr = np.asarray(_ninf if val is None else val, dtype=np.float64)
+            if arr.ndim == 0:
+                return np.full(count, float(arr), dtype=np.float64)
+            if arr.shape != (count,):
+                raise ValueError(
+                    f"VectorConstraint '{self.name}': RHS array shape {arr.shape} "
+                    f"does not match the {count} selected row(s)."
+                )
+            return arr
+
+        if lb is not NOTSET:
+            v = _vals(lb if lb is not None else _ninf)
+            if pos is None:
+                self._row_lb[:] = v
+            else:
+                self._row_lb[pos] = v
+        if ub is not NOTSET:
+            v = _vals(ub if ub is not None else _inf)
+            if pos is None:
+                self._row_ub[:] = v
+            else:
+                self._row_ub[pos] = v
+        self._mark_rows_dirty(pos)
+
+    def pop_dirty_rows(self):
+        """Return dirty row positions (int array, or None=all) and clear."""
+        d = self._dirty_rows
+        self._dirty_rows = set()
+        if d is None:
+            return None
+        return np.array(sorted(d), dtype=np.int64)
+
+    def mark_all_rows_dirty(self):
+        self._dirty_rows = None
 
     # ------------------------------------------------------------------ #
     # Row -> (VectorVar, position) mapping for a single (sparse) row

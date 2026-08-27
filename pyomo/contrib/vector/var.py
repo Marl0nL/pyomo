@@ -100,7 +100,9 @@ class VectorVarData(VarData):
     @_lb.setter
     def _lb(self, val):
         # store None as NaN so the "no explicit bound" state round-trips
-        self._component()._lb_arr[self._pos] = np.nan if val is None else val
+        c = self._component()
+        c._lb_arr[self._pos] = np.nan if val is None else val
+        c._mark_bounds_dirty(self._pos)
 
     @property
     def _ub(self):
@@ -109,7 +111,9 @@ class VectorVarData(VarData):
 
     @_ub.setter
     def _ub(self, val):
-        self._component()._ub_arr[self._pos] = np.nan if val is None else val
+        c = self._component()
+        c._ub_arr[self._pos] = np.nan if val is None else val
+        c._mark_bounds_dirty(self._pos)
 
     @property
     def _value(self):
@@ -118,7 +122,13 @@ class VectorVarData(VarData):
 
     @_value.setter
     def _value(self, val):
-        self._component()._value_arr[self._pos] = np.nan if val is None else val
+        c = self._component()
+        c._value_arr[self._pos] = np.nan if val is None else val
+        # A fixed variable's value pins its column bounds, so a value write on a
+        # fixed entry is a bounds change for the persistent (changeColsBounds)
+        # re-solve path.
+        if c._fixed_arr[self._pos]:
+            c._mark_bounds_dirty(self._pos)
 
     @property
     def _fixed(self):
@@ -126,7 +136,10 @@ class VectorVarData(VarData):
 
     @_fixed.setter
     def _fixed(self, val):
-        self._component()._fixed_arr[self._pos] = bool(val)
+        c = self._component()
+        c._fixed_arr[self._pos] = bool(val)
+        # Fixing/unfixing changes the effective column bounds (pin vs. release).
+        c._mark_bounds_dirty(self._pos)
 
     @property
     def _domain(self):
@@ -187,6 +200,12 @@ class VectorVar(IndexedComponent):
         self._pos_of = None  # dict: index -> position
         self._scalarized = False
         self._scalarizing = False
+        # Dirty-column tracking for the persistent (warm) re-solve path: the set
+        # of positions whose effective column bounds (explicit bound, fixed flag,
+        # or a fixed entry's value) changed since the last ``pop_dirty_bounds``.
+        # ``None`` means "everything is dirty" (e.g. a freshly (re)constructed
+        # component); an empty set means "nothing changed since last sync".
+        self._dirty_bounds = None
 
     # ------------------------------------------------------------------ #
     # Construction
@@ -283,6 +302,143 @@ class VectorVar(IndexedComponent):
 
     def get_units(self):
         return self._units
+
+    # ------------------------------------------------------------------ #
+    # Bulk mutation + dirty tracking (Phase-2 mutability)
+    # ------------------------------------------------------------------ #
+    def _mark_bounds_dirty(self, pos):
+        """Record that column ``pos``'s effective bounds changed."""
+        if self._dirty_bounds is None:
+            return  # already "all dirty"
+        self._dirty_bounds.add(int(pos))
+
+    def _resolve_where(self, where):
+        """Normalize a ``where=`` selector to an int position array (or None=all).
+
+        ``where`` may be ``None`` (all columns), a boolean mask of length ``n``,
+        or an array/sequence of integer column positions.  Bulk mutation is
+        expressed in *position* space (the array-native contract); per-index
+        mutation goes through the materialized view (``m.x[key].setlb(...)``).
+        """
+        if where is None:
+            return None
+        arr = np.asarray(where)
+        if arr.dtype == bool:
+            if arr.shape != (self._n,):
+                raise ValueError(
+                    f"VectorVar '{self.name}': boolean 'where' mask has shape "
+                    f"{arr.shape}, expected ({self._n},)."
+                )
+            return np.nonzero(arr)[0]
+        return arr.astype(np.int64, copy=False).ravel()
+
+    def _dirty_after(self, positions):
+        """Mark ``positions`` (an int array, or None=all) bounds-dirty."""
+        if positions is None:
+            self._dirty_bounds = None  # everything dirty
+        elif self._dirty_bounds is not None:
+            self._dirty_bounds.update(int(p) for p in positions)
+
+    @staticmethod
+    def _broadcast_values(val, positions, n, name):
+        """Broadcast ``val`` (scalar or array) to the selected positions' length."""
+        count = n if positions is None else len(positions)
+        arr = np.asarray(np.nan if val is None else val, dtype=np.float64)
+        if arr.ndim == 0:
+            return np.full(count, float(arr), dtype=np.float64)
+        if arr.shape != (count,):
+            raise ValueError(
+                f"VectorVar '{name}': {arr.shape}-shaped value does not match "
+                f"the {count} selected column(s)."
+            )
+        return arr
+
+    def setlb(self, value, where=None):
+        """Bulk-set the explicit lower bound (``None``/NaN == no explicit lb).
+
+        ``value`` is a scalar (broadcast) or an array over the selection;
+        ``where`` selects columns (see :meth:`_resolve_where`).  Marks the
+        touched columns bounds-dirty for the persistent re-solve path.
+        """
+        pos = self._resolve_where(where)
+        vals = self._broadcast_values(value, pos, self._n, self.name)
+        if pos is None:
+            self._lb_arr[:] = vals
+        else:
+            self._lb_arr[pos] = vals
+        self._dirty_after(pos)
+
+    def setub(self, value, where=None):
+        """Bulk-set the explicit upper bound (``None``/NaN == no explicit ub)."""
+        pos = self._resolve_where(where)
+        vals = self._broadcast_values(value, pos, self._n, self.name)
+        if pos is None:
+            self._ub_arr[:] = vals
+        else:
+            self._ub_arr[pos] = vals
+        self._dirty_after(pos)
+
+    def set_bounds(self, lb, ub, where=None):
+        """Bulk-set both bounds at once (convenience)."""
+        self.setlb(lb, where=where)
+        self.setub(ub, where=where)
+
+    def fix(self, value=NOTSET, where=None):
+        """Bulk-fix columns (optionally to ``value``); marks bounds-dirty.
+
+        Fixing pins a column to its value (``load_highs``) or removes it via
+        substitution (``compile_standard_form``); either way the effective
+        column bounds change, so the touched columns are recorded dirty.
+        """
+        pos = self._resolve_where(where)
+        if pos is None:
+            self._fixed_arr[:] = True
+        else:
+            self._fixed_arr[pos] = True
+        if value is not NOTSET:
+            self.set_values(value, where=where)
+        self._dirty_after(pos)
+
+    def unfix(self, where=None):
+        """Bulk-unfix columns; marks bounds-dirty (the pin is released)."""
+        pos = self._resolve_where(where)
+        if pos is None:
+            self._fixed_arr[:] = False
+        else:
+            self._fixed_arr[pos] = False
+        self._dirty_after(pos)
+
+    def set_values(self, values, where=None):
+        """Bulk-write the value array (e.g. solution load-back).
+
+        Only marks a column dirty when it is *fixed* (an unfixed variable's
+        value does not enter the matrix, so it is not a re-solve change).
+        """
+        pos = self._resolve_where(where)
+        vals = self._broadcast_values(values, pos, self._n, self.name)
+        if pos is None:
+            self._value_arr[:] = vals
+            fixed = np.nonzero(self._fixed_arr)[0]
+        else:
+            self._value_arr[pos] = vals
+            fixed = pos[self._fixed_arr[pos]]
+        self._dirty_after(fixed if len(fixed) else np.empty(0, dtype=np.int64))
+
+    def pop_dirty_bounds(self):
+        """Return the dirty column positions (int array) and clear the set.
+
+        Returns ``None`` when *every* column is dirty (the caller must resync all
+        columns), otherwise a sorted int array of changed positions.  After this
+        call the component is "clean" (empty dirty set).
+        """
+        d = self._dirty_bounds
+        self._dirty_bounds = set()
+        if d is None:
+            return None
+        return np.array(sorted(d), dtype=np.int64)
+
+    def mark_all_dirty(self):
+        self._dirty_bounds = None
 
     # ------------------------------------------------------------------ #
     # Materialize-on-touch

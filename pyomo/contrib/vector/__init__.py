@@ -67,9 +67,19 @@ from pyomo.contrib.vector.matrices import (
 from pyomo.contrib.vector.highs import (
     load_highs,
     solve_highs,
+    load_solution,
     matrices_to_highs_lp,
     matrices_to_highs_model,
     QuadraticModelError,
+)
+
+# Phase 2 -- persistent warm re-solve driven directly by columnar-component
+# mutation (bounds / fixed pins / row masks / RHS), pushed through HiGHS's
+# incremental changeColsBounds / changeRowsBounds APIs with the basis retained.
+from pyomo.contrib.vector.persistent import (
+    VectorPersistentHighs,
+    VectorSolveResult,
+    PersistentStructureError,
 )
 
 # Importing fastload registers the ``highs_fastload`` solver with both the v2
@@ -118,9 +128,13 @@ __all__ = [
     'VectorPathDisabledError',
     'load_highs',
     'solve_highs',
+    'load_solution',
     'matrices_to_highs_lp',
     'matrices_to_highs_model',
     'QuadraticModelError',
+    'VectorPersistentHighs',
+    'VectorSolveResult',
+    'PersistentStructureError',
     'FastLoadHighs',
     'compile_to_highs_arrays',
     'compile_fastload_arrays',
