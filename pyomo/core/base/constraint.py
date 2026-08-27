@@ -15,11 +15,7 @@ from pyomo.common.pyomo_typing import overload
 from typing import Union, Type
 
 from pyomo.common.deprecation import RenamedClass, deprecated
-from pyomo.common.errors import (
-    DeveloperError,
-    InvalidConstraintError,
-    TemplateExpressionError,
-)
+from pyomo.common.errors import DeveloperError, InvalidConstraintError
 from pyomo.common.formatting import tabular_writer
 from pyomo.common.log import is_debug_set
 from pyomo.common.modeling import NOTSET
@@ -45,7 +41,10 @@ from pyomo.core.expr.relational_expr import (
     TrivialRelationalExpression,
     tuple_to_relational_expr,
 )
-from pyomo.core.expr.template_expr import templatize_constraint
+from pyomo.core.expr.template_expr import (
+    templatize_constraint,
+    suppress_templatization_errors,
+)
 from pyomo.core.base.component import ActiveComponentData, ModelComponentFactory
 from pyomo.core.base.global_set import UnindexedComponent_index
 from pyomo.core.base.indexed_component import (
@@ -544,7 +543,42 @@ class TemplateDataMixin:
             self._expr = tmp
 
 
-class TemplateConstraintData(TemplateDataMixin, ConstraintData):
+class _ScalarizeConstraintOnTouch:
+    """Materialize-on-touch scalarization contract for template constraints.
+
+    ``TemplateDataMixin.expr`` already resolves the template and converts the
+    instance to its classic base class in place (preserving identity).  The other
+    public accessors an *unaware* consumer might reach for -- ``.body``,
+    ``.lower``, ``.upper`` (and thus ``generate_standard_repn(cd.body)``, FBBT,
+    transformations) -- must do the same, so that touching a single row yields a
+    classically-behaving object (scoping doc 6.5).  ``to_bounded_expression`` is
+    intentionally left returning the raw template: it is the hook the
+    template-aware standard-form compiler uses; unaware consumers go through the
+    properties below.  This mixin must precede ``TemplateDataMixin`` in the MRO
+    (so ``set_value`` still resolves to the correct classic base class).
+    """
+
+    __slots__ = ()
+
+    @property
+    def body(self):
+        self.expr  # resolve + convert to a classic ConstraintData in place
+        return self.body
+
+    @property
+    def lower(self):
+        self.expr
+        return self.lower
+
+    @property
+    def upper(self):
+        self.expr
+        return self.upper
+
+
+class TemplateConstraintData(
+    _ScalarizeConstraintOnTouch, TemplateDataMixin, ConstraintData
+):
     __slots__ = ()
 
     def __init__(self, template_info, component, index):
@@ -689,8 +723,36 @@ class Constraint(ActiveIndexedComponent):
                 pass
             else:
                 if TEMPLATIZE_CONSTRAINTS:
+                    template_info = None
                     try:
-                        template_info = templatize_constraint(self)
+                        with suppress_templatization_errors():
+                            template_info = templatize_constraint(self)
+                    except Exception:
+                        # Templatization is an opportunistic fast path.  A rule
+                        # that does not templatize -- index conditionals
+                        # (``if i == 0``), filtered sums (``for j in J if
+                        # j != n``), modulo / non-affine indexing, unhashable
+                        # index-dependent lookups, etc. -- raises here (a
+                        # TemplateExpressionError, or the PyomoException /
+                        # TypeError / KeyError the rule itself produces when
+                        # called with IndexTemplate arguments).  On ANY such
+                        # failure we fall back to classic per-index
+                        # construction below, which is the ground truth and
+                        # will re-raise any genuine rule error with a concrete
+                        # index (scoping doc Sec 6.5; Phase-3 mandatory
+                        # scalarization fallback).
+                        if is_debug_set(logger):
+                            logger.debug(
+                                "Constraint %s did not templatize; falling back "
+                                "to classic per-index construction (%s: %s)"
+                                % (
+                                    self.name,
+                                    type(sys.exc_info()[1]).__name__,
+                                    sys.exc_info()[1],
+                                )
+                            )
+                        template_info = None
+                    if template_info is not None:
                         if self.is_indexed():
                             comp = weakref_ref(self)
                             self._data = {
@@ -703,8 +765,6 @@ class Constraint(ActiveIndexedComponent):
                             self._expr = template_info
                             self._data = {None: self}
                         return
-                    except TemplateExpressionError:
-                        pass
 
                 # Bypass the index validation and create the member directly
                 for index in self.index_set():
@@ -950,7 +1010,9 @@ class AbstractSimpleConstraint(metaclass=RenamedClass):
     __renamed__version__ = '6.0'
 
 
-class TemplateScalarConstraint(TemplateDataMixin, ScalarConstraint):
+class TemplateScalarConstraint(
+    _ScalarizeConstraintOnTouch, TemplateDataMixin, ScalarConstraint
+):
     pass
 
 
