@@ -562,14 +562,19 @@ def _self_check_plan(plan, groups):
     if len(P0):
         rng = np.random.RandomState(0)
         Pp = P0 + rng.uniform(-1.0, 1.0, size=P0.shape) + 0.5
-        saved = [p.value for p in plan.params]
+        # Write the transient probe values straight to the Param storage: a
+        # perturbation may leave a Param's declared domain (e.g. a negative value
+        # on a NonNegativeReals price), which the validating ``.value`` setter
+        # rejects.  The values are restored immediately, so bypassing validation
+        # here is safe and only affects this in-memory self-check.
+        saved = [_pd_get(p) for p in plan.params]
         try:
             for p, v in zip(plan.params, Pp):
-                p.value = float(v)
+                _pd_set(p, float(v))
             _run(Pp, ground_truth=True)  # vs a fresh value() evaluation
         finally:
             for p, v in zip(plan.params, saved):
-                p.value = v
+                _pd_set(p, v)
 
 
 def _assert_template_close(got, ref, what):
@@ -1059,6 +1064,18 @@ def _structure_fingerprint(model):
         n_var += len(x)
     obj = _active_objective(model)
     return (n_con, n_var, id(obj))
+
+
+def _pd_get(p):
+    """Current value of a mutable ``ParamData``."""
+    return value(p)
+
+
+def _pd_set(p, v):
+    """Write a value straight to a ``ParamData``'s storage, bypassing the
+    validating ``.value`` setter (used only for the transient self-check probe,
+    which may leave a Param's declared domain and is restored immediately)."""
+    p._value = v
 
 
 def _finite(arr, hinf):

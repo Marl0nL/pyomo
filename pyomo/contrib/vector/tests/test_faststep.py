@@ -165,6 +165,31 @@ class TestFastStepBasics(unittest.TestCase):
         s.solve()
         self.assertAlmostEqual(pyo.value(m.obj), 5.0, places=6)
 
+    def test_domain_constrained_mutable_param(self):
+        # A mutable Param with a restricted domain (NonNegativeReals): the
+        # set_instance self-check perturbs the parameter vector and must not trip
+        # the Param's domain validation on a transient probe value.
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = pyo.ConcreteModel()
+        m.price = pyo.Param(
+            [0, 1], domain=pyo.NonNegativeReals, initialize=1.0, mutable=True
+        )
+        m.cap = pyo.Param(domain=pyo.NonNegativeReals, initialize=5.0, mutable=True)
+        m.x = pyo.Var([0, 1], domain=pyo.NonNegativeReals, bounds=(0, 10))
+        m.c = pyo.Constraint(expr=m.x[0] + m.x[1] <= m.cap)
+        m.d = pyo.Constraint(expr=m.x[0] + m.x[1] >= 1)
+        m.obj = pyo.Objective(expr=sum(m.price[i] * m.x[i] for i in (0, 1)))
+        s = FastStepHighs()
+        s.set_instance(m)  # must not raise a Param domain ValueError
+        res = s.solve()
+        self.assertEqual(
+            res.termination_condition, self.TC.convergenceCriteriaSatisfied
+        )
+        # The probe restores the Params exactly.
+        self.assertEqual(pyo.value(m.price[0]), 1.0)
+        self.assertEqual(pyo.value(m.cap), 5.0)
+
     def test_rhs_and_bound_update(self):
         from pyomo.contrib.vector import FastStepHighs
 
