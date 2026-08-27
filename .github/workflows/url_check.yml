@@ -1,8 +1,6 @@
 name: URL Validation
 
 on:
-  schedule:
-    - cron: '0 3 * * 0'
   workflow_dispatch:
     inputs:
       git-ref:
