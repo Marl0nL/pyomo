@@ -1,11 +1,6 @@
 name: Pyomo Release Distribution Creation
 
 on:
-  push:
-    tags:
-      - '*'
-  schedule:
-    - cron: '0 0 3 * *'
   workflow_dispatch:
     inputs:
       git-ref:
