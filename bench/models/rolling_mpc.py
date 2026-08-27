@@ -42,7 +42,19 @@ SIZES: Dict[str, Dict[str, Any]] = {
 }
 
 
-def build_pyomo(params: Dict[str, Any]) -> pyo.ConcreteModel:
+def build_pyomo(
+    params: Dict[str, Any], mutable_matrix: bool = False
+) -> pyo.ConcreteModel:
+    """Build the rolling-horizon MPC model.
+
+    ``mutable_matrix=True`` puts the charge efficiency into a *mutable* ``Param``
+    ``eff[a,t]`` on the state-of-charge recurrence -- a **nominally-mutable
+    constraint-matrix coefficient**.  Under :func:`apply_roll` (an equal-interval
+    roll) that Param never changes, so the matrix is static *in value* while the
+    mutability *flag* says otherwise -- exactly the case the ``highs_faststep``
+    value guard exists to accept.  ``False`` (the default) bakes the efficiency in
+    as a constant, giving the pure-static-matrix model.
+    """
     A = int(params["A"])
     T = int(params["T"])
     m = pyo.ConcreteModel()
@@ -64,13 +76,32 @@ def build_pyomo(params: Dict[str, Any]) -> pyo.ConcreteModel:
         mutable=True,
     )
 
+    if mutable_matrix:
+        m.eff = pyo.Param(
+            m.A,
+            m.T,
+            initialize={(a, t): EFF for a in range(A) for t in range(T)},
+            mutable=True,
+        )
+
+        def _eff(mm, a, t):
+            return mm.eff[a, t]
+
+    else:
+
+        def _eff(mm, a, t):
+            return EFF
+
     m.p = pyo.Var(m.A, m.T, domain=pyo.NonNegativeReals)
     m.soc = pyo.Var(m.A, m.T, bounds=(0.0, SOC_MAX))
 
     def socrule(mm, a, t):
         if t == 0:
-            return mm.soc[a, t] == EFF * mm.p[a, t] - mm.dem[a, t]
-        return mm.soc[a, t] == mm.soc[a, t - 1] + EFF * mm.p[a, t] - mm.dem[a, t]
+            return mm.soc[a, t] == _eff(mm, a, t) * mm.p[a, t] - mm.dem[a, t]
+        return (
+            mm.soc[a, t]
+            == mm.soc[a, t - 1] + _eff(mm, a, t) * mm.p[a, t] - mm.dem[a, t]
+        )
 
     m.socc = pyo.Constraint(m.A, m.T, rule=socrule)
     m.grid = pyo.Constraint(

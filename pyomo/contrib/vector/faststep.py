@@ -79,6 +79,37 @@ standard-form arrays at the current ``P`` *and* at a random perturbation of
 references a fixed variable, is evaluated per-solve with ``value()`` as a
 residual; correctness is preserved, only that entry is not vectorized.)
 
+Value-aware static-matrix guard (constraint-matrix coefficients)
+----------------------------------------------------------------
+Many real rolling models carry *nominally* mutable ``Param`` coefficients on the
+constraint matrix -- an interval duration in a state-of-charge recurrence, an
+efficiency, a per-step gain -- whose **values do not actually change** between
+warm solves (an equal-interval roll leaves the durations fixed).  Rejecting such
+a model on the mutability *flag* alone -- the pre-guard behavior -- turned away a
+large, warm-solvable class of models.
+
+Instead of trusting the flag, :class:`FastStepHighs` **verifies the values**.  At
+``set_instance`` a mutable matrix coefficient is captured into the
+:class:`_MatrixGuard` -- the affine template over ``P`` for every affected
+``A``-entry, plus the values HiGHS was loaded with (the same template machinery
+the objective / RHS / bound groups use).  Each warm solve re-evaluates those
+coefficients **vectorized** (one sparse ``M @ P``, no per-coefficient Python
+walk) and compares them to that baseline:
+
+* **unchanged** (exact by default, or a configurable tight tolerance) -- the
+  matrix HiGHS holds is still correct, so the warm basis is kept; the comparison
+  is the guard's only per-roll cost;
+* **genuinely changed** -- never a stale-matrix solve.  The default
+  ``on_matrix_change='error'`` fails loud, naming the offending Param /
+  coefficient(s); the opt-in ``on_matrix_change='reload'`` instead rebuilds the
+  whole standard-form matrix and reloads it (a fresh ``passModel``, basis reset)
+  for that solve, then continues.
+
+The guard's coefficient mapping (which mutable Params feed which ``A``-entries,
+with what affine relation) is a standalone, reusable component: a later batch
+matrix-update path can reuse it to *apply* a genuine change; this guard only
+*detects* change.
+
 Scope (fail loud, never a stale-matrix solve)
 ---------------------------------------------
 * **Linear** continuous / MIP models only (inherited from the standard-form
@@ -87,11 +118,13 @@ Scope (fail loud, never a stale-matrix solve)
   (row) bounds / RHS, and variable bounds**, all driven by mutable ``Param``
   values (or fixed-variable values).  This is exactly the rolling-horizon roll:
   prices move the objective, forecasts/limits move the RHS and bounds.
-* **Constraint-matrix coefficients are treated as static.**  A mutable coefficient
-  on a *free* variable (the matrix ``A`` would change between rolls) is rejected
-  at ``set_instance`` -- updating ``A`` in place is out of scope, and silently
-  ignoring it would risk a stale-matrix solve.  (On an equal-interval roll the
-  matrix genuinely does not change; see the Phase-4 report.)
+* **Constraint-matrix coefficients are value-guarded, not assumed static.**  A
+  mutable matrix coefficient is accepted (see the value-guard section above); a
+  coefficient that stays put warm-solves on the kept basis, one that genuinely
+  changes fails loud or (opt-in) triggers a reload -- never a stale solve.  A
+  coefficient that is genuinely *nonlinear in the parameters* (e.g. a product of
+  two Params) cannot be templated affinely and is still rejected at
+  ``set_instance`` by the template self-check.
 * A **structure change** between solves (a constraint or variable added/removed,
   the objective swapped) is caught by a cheap fingerprint check and rejected --
   the caller must build a fresh :class:`FastStepHighs`.
@@ -275,6 +308,90 @@ def _build_affine_array(slots, param_index, n_params, open_sign):
 
 
 # --------------------------------------------------------------------------- #
+# The constraint-matrix value guard (a reusable coefficient mapping)
+# --------------------------------------------------------------------------- #
+class _MatrixGuard:
+    """The value-aware static-matrix guard: which mutable Params feed which
+    ``A``-entries, and the affine relation that produces them.
+
+    A classic linear model can carry *nominally* mutable ``Param`` coefficients
+    on its constraint matrix -- an interval duration in a state-of-charge
+    recurrence, an efficiency, a per-step gain -- whose **values never actually
+    change** between warm rolls (an equal-interval roll leaves the durations
+    fixed).  The mutability *flag* is pessimistic; rejecting such a model on the
+    flag alone (the pre-guard behavior) turns away a large class of real rolling
+    models that are perfectly warm-solvable.
+
+    This component replaces *trust-the-flag* with *verify-the-values*.  It
+    records, against the compiler's stable ``A``-entry identity, every mutable
+    matrix coefficient as an :class:`_AffineArray` over the parameter vector
+    ``P`` (``coef_values = M @ P + shift`` -- the same template family the
+    objective / RHS / bound groups use) together with the target ``(row, col)``
+    index arrays and the coefficient values HiGHS was loaded with.  On each warm
+    solve the affected coefficients are re-evaluated **vectorized** (one sparse
+    ``M @ P``, no per-coefficient Python walk) and compared to that baseline:
+
+    * unchanged -> the matrix HiGHS holds is still correct, keep the warm basis
+      (the fast path);
+    * changed -> never a stale-matrix solve (:class:`FastStepHighs` fails loud or,
+      opt-in, reloads).
+
+    The mapping (``rows`` / ``cols`` / ``affine``, keyed to the compiled matrix)
+    is a standalone component on purpose: a later batch matrix-update path can
+    reuse exactly this (which Params feed which ``A``-entries, with what affine
+    relation) to *apply* a genuine change; this guard only **detects** change.
+
+    ``provenance`` carries one ``(constraint_name, variable_name, coef_expr)``
+    per entry so a fail-loud message can name the offending coefficient(s).
+    """
+
+    __slots__ = ('rows', 'cols', 'affine', 'baseline', 'provenance')
+
+    def __init__(self, rows, cols, affine, baseline, provenance):
+        self.rows = rows  # int32[N]: A row index per guarded entry
+        self.cols = cols  # int32[N]: A col index per guarded entry
+        self.affine = affine  # _AffineArray[N]: coefficient values from P
+        self.baseline = baseline  # float64[N]: the values HiGHS was loaded with
+        self.provenance = provenance  # list[(con_name, var_name, coef_expr)]
+
+    @property
+    def is_empty(self):
+        return self.affine is None or self.affine.n == 0
+
+    @property
+    def has_residual(self):
+        return self.affine is not None and self.affine.has_residual
+
+    def current(self, P, hinf):
+        """Re-evaluate every guarded coefficient at ``P`` (vectorized)."""
+        return self.affine.compute(P, hinf)
+
+    def changed_mask(self, current, atol, rtol):
+        """Boolean mask of entries whose value moved off the loaded baseline.
+
+        ``atol == rtol == 0`` (the default) is an exact comparison: any nonzero
+        drift trips the guard.  A tight tolerance is opt-in.
+        """
+        return np.abs(current - self.baseline) > (atol + rtol * np.abs(self.baseline))
+
+    def describe(self, changed, current, limit=8):
+        """Human-readable list of the changed coefficients (for fail-loud)."""
+        idx = np.nonzero(changed)[0]
+        lines = []
+        for k in idx[:limit]:
+            con_name, var_name, coef = self.provenance[int(k)]
+            params = sorted({p.name for p in identify_mutable_parameters(coef)})
+            pnote = f" [Param(s): {', '.join(params)}]" if params else ""
+            lines.append(
+                f"  - constraint '{con_name}' coefficient on variable "
+                f"'{var_name}': {self.baseline[k]!r} -> {current[k]!r}{pnote}"
+            )
+        if len(idx) > limit:
+            lines.append(f"  - ... and {len(idx) - limit} more")
+        return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
 # The mutable-update plan
 # --------------------------------------------------------------------------- #
 class _MutablePlan:
@@ -297,6 +414,7 @@ class _MutablePlan:
         'col_idx',
         'col_lower_affine',
         'col_upper_affine',
+        'matrix_guard',
     )
 
     def read_param_vector(self):
@@ -316,6 +434,8 @@ class _MutablePlan:
         ):
             if a is not None and a.has_residual:
                 return True
+        if self.matrix_guard is not None and self.matrix_guard.has_residual:
+            return True
         return False
 
 
@@ -327,10 +447,19 @@ def _active_objective(model):
 def _build_mutable_plan(model, compiled: FastLoadCompiled):
     """Derive the :class:`_MutablePlan` (parameter registry + affine templates).
 
-    Raises :class:`IncompatibleModelError` on a mutable constraint-matrix
-    coefficient (the matrix ``A`` would change between rolls -- out of scope).
+    A mutable constraint-matrix coefficient is **not** rejected: it is captured
+    into the :class:`_MatrixGuard` (the affine template over ``P`` for every
+    affected ``A``-entry, plus the values HiGHS was loaded with), so a warm solve
+    can *verify the values* rather than *trust the mutability flag*.  See the
+    module docstring's "Value-aware static-matrix guard" section.
     """
     col_of = {id(v): j for j, v in enumerate(compiled.columns)}
+
+    # id(constraint) -> the A-row index/indices it maps to (a range row splits
+    # into two rows that share one body, so both carry the same coefficients).
+    con_rows = {}
+    for i, (con, _mult) in enumerate(compiled.rows):
+        con_rows.setdefault(id(con), []).append(i)
 
     # --- collect the mutable slots (expressions / constants) per group ------ #
     obj_cols = []
@@ -363,6 +492,11 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
     row_idx = []
     row_lower_slots = []
     row_upper_slots = []
+    # Guarded matrix coefficients, collected per (row, col) A-entry.
+    mat_rows = []
+    mat_cols = []
+    mat_slots = []
+    mat_prov = []
     body_cache = {}
     for i, (con, mult) in enumerate(compiled.rows):
         cid = id(con)
@@ -376,15 +510,18 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
                     f"The '{FastStepHighs.name}' warm interface only supports linear "
                     "constraints."
                 )
+            # A *mutable* coefficient on a free variable is a mutable A-entry.
+            # Rather than reject the model on the flag, capture it into the value
+            # guard (one entry per A-row the constraint occupies -- a range row
+            # occupies two, both with the same body coefficients).
             for coef, v in zip(repn.linear_coefs, repn.linear_vars):
-                if id(v) in col_of and not is_constant(coef):
-                    raise IncompatibleModelError(
-                        f"The '{FastStepHighs.name}' warm interface treats the "
-                        "constraint matrix as static, but constraint "
-                        f"'{con.name}' has a mutable coefficient on variable "
-                        f"'{v.name}'.  Matrix-coefficient updates are out of scope; "
-                        "use 'highs_fastload' for a fresh compile per solve."
-                    )
+                j = col_of.get(id(v))
+                if j is not None and not is_constant(coef):
+                    for ri in con_rows[cid]:
+                        mat_rows.append(ri)
+                        mat_cols.append(j)
+                        mat_slots.append(coef)
+                        mat_prov.append((con.name, v.name, coef))
             body_cache[cid] = repn
         offset = repn.constant
 
@@ -442,6 +579,7 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
     _register(row_upper_slots)
     _register(col_lower_slots)
     _register(col_upper_slots)
+    _register(mat_slots)
     n_params = len(params)
 
     # --- affine templates --------------------------------------------------- #
@@ -469,6 +607,20 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
     plan.col_upper_affine = _build_affine_array(
         col_upper_slots, param_index, n_params, +1
     )
+
+    # --- matrix-coefficient template (the value guard) ---------------------- #
+    matrix_affine = _build_affine_array(mat_slots, param_index, n_params, +1)
+    mat_rows_arr = np.fromiter(mat_rows, dtype=np.int32, count=len(mat_rows))
+    mat_cols_arr = np.fromiter(mat_cols, dtype=np.int32, count=len(mat_cols))
+    if mat_rows:
+        # The element-wise values HiGHS was loaded with (an absent A-entry -- a
+        # coefficient that is currently zero -- reads back as 0.0).
+        Acsr = compiled.A.tocsr()
+        mat_loaded = (
+            np.asarray(Acsr[mat_rows_arr, mat_cols_arr]).ravel().astype(np.float64)
+        )
+    else:
+        mat_loaded = None
 
     # --- self-check: templates must reproduce the loaded matrix (at the current
     # P) and a fresh value() evaluation (at a random perturbation of P) -------- #
@@ -515,8 +667,25 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
             +1,
             compiled.col_upper[plan.col_idx] if len(plan.col_idx) else None,
         ),
+        ('constraint matrix coefficient', mat_slots, matrix_affine, +1, mat_loaded),
     ]
     _self_check_plan(plan, groups)
+
+    # --- matrix value guard --------------------------------------------------- #
+    # Baseline the guard against the template's *own* value at the current P (not
+    # the compiled matrix directly): the self-check above already tied the two
+    # together to ~1e-8, and using the template's value makes an unchanged roll
+    # compare bit-exact (no spurious trip from M @ P vs compiler arithmetic).
+    if mat_rows:
+        import highspy
+
+        hinf = highspy.kHighsInf
+        baseline = matrix_affine.compute(plan.read_param_vector(), hinf)
+    else:
+        baseline = mat_cols_arr.astype(np.float64)  # empty float64 array
+    plan.matrix_guard = _MatrixGuard(
+        mat_rows_arr, mat_cols_arr, matrix_affine, baseline, mat_prov
+    )
     return plan
 
 
@@ -609,9 +778,12 @@ class FastStepHighs:
     CONFIG = BranchAndBoundConfig()
     name = 'highs_faststep'
 
+    #: Accepted ``on_matrix_change`` policies (see :meth:`set_instance`).
+    _MATRIX_CHANGE_POLICIES = ('error', 'reload')
+
     _available = None
 
-    def __init__(self):
+    def __init__(self, on_matrix_change='error', matrix_atol=0.0, matrix_rtol=0.0):
         self.config = self.CONFIG()
         self._model = None
         self._compiled = None
@@ -621,6 +793,19 @@ class FastStepHighs:
         self._fingerprint = None
         self._col_map = None
         self._n_solves = 0
+        # Value-aware static-matrix guard policy.
+        self._on_matrix_change = self._check_matrix_policy(on_matrix_change)
+        self._matrix_atol = float(matrix_atol)
+        self._matrix_rtol = float(matrix_rtol)
+
+    @classmethod
+    def _check_matrix_policy(cls, policy):
+        if policy not in cls._MATRIX_CHANGE_POLICIES:
+            raise ValueError(
+                f"on_matrix_change must be one of {cls._MATRIX_CHANGE_POLICIES!r}; "
+                f"got {policy!r}."
+            )
+        return policy
 
     # ------------------------------------------------------------------ #
     # availability / version
@@ -652,8 +837,34 @@ class FastStepHighs:
     # ------------------------------------------------------------------ #
     # setup
     # ------------------------------------------------------------------ #
-    def set_instance(self, model, **options):
-        """Compile ``model`` once, build the affine templates, and load HiGHS."""
+    def set_instance(
+        self,
+        model,
+        *,
+        on_matrix_change=None,
+        matrix_atol=None,
+        matrix_rtol=None,
+        **options,
+    ):
+        """Compile ``model`` once, build the affine templates, and load HiGHS.
+
+        Value-aware static-matrix guard options (may also be set on the
+        constructor):
+
+        on_matrix_change : {'error', 'reload'}
+            What to do when a warm solve finds a constraint-matrix coefficient
+            has genuinely changed since ``set_instance``.  ``'error'`` (the
+            default) fails loud, naming the offending coefficient(s) -- a warm
+            re-solve on the retained basis would use a stale matrix.  ``'reload'``
+            transparently rebuilds the whole standard-form matrix and reloads it
+            (basis reset) for that solve, then continues.  Neither ever solves a
+            stale matrix.
+        matrix_atol, matrix_rtol : float
+            The comparison tolerance against the loaded coefficient values.  Both
+            default to ``0.0`` -- an **exact** comparison, so any drift trips the
+            guard.  Widen for a tight tolerance on models whose matrix Params
+            round-trip with tiny numerical noise.
+        """
         import highspy
 
         if not self.available():
@@ -661,6 +872,12 @@ class FastStepHighs:
                 f"The '{self.name}' warm interface requires highspy, which is not "
                 "available in this environment."
             )
+        if on_matrix_change is not None:
+            self._on_matrix_change = self._check_matrix_policy(on_matrix_change)
+        if matrix_atol is not None:
+            self._matrix_atol = float(matrix_atol)
+        if matrix_rtol is not None:
+            self._matrix_rtol = float(matrix_rtol)
         if options:
             self.config = self.config(value=options, preserve_implicit=True)
 
@@ -791,6 +1008,56 @@ class FastStepHighs:
                 "changes on a fixed structure."
             )
 
+    def _matrix_change_error(self, guard, changed, current, array_mode):
+        details = guard.describe(changed, current)
+        if array_mode:
+            remedy = (
+                " The array-driven (param_values) path cannot reload from the "
+                "model, so a matrix change is always fatal here; drive the solve "
+                "from the model (omit param_values) with on_matrix_change='reload' "
+                "to rebuild instead."
+            )
+        else:
+            remedy = (
+                " Set on_matrix_change='reload' to rebuild and reload the matrix "
+                "(basis reset) for this solve instead of failing."
+            )
+        return IncompatibleModelError(
+            f"The '{self.name}' warm interface detected a genuine change in "
+            f"{int(changed.sum())} constraint-matrix coefficient(s) since "
+            "set_instance; a warm re-solve on the retained basis would use a "
+            f"stale matrix.{remedy}\n{details}"
+        )
+
+    def _reload_model(self, P, hinf):
+        """Rebuild + reload the whole matrix (the ``on_matrix_change='reload'``
+        path): a fresh standard-form compile and ``passModel`` (basis reset).
+
+        Deliberately *not* an incremental matrix edit -- applying a genuinely
+        changed ``A`` as batch updates is a later stage that reuses the guard's
+        coefficient mapping; this path just re-loads the whole model.  If the
+        recompile shifts the matrix *shape* (e.g. a coefficient rolled to exactly
+        zero and dropped a column/nonzero), the templates and mapping would no
+        longer line up, so the whole instance is rebuilt from scratch.
+        """
+        compiled = compile_to_highs_arrays(self._model)
+        if (
+            compiled.n_col != self._compiled.n_col
+            or compiled.n_row != self._compiled.n_row
+            or compiled.nnz != self._compiled.nnz
+        ):
+            self.set_instance(self._model)
+            return
+        lp = build_highs_lp(compiled)
+        self._highs.passModel(lp)
+        self._compiled = compiled
+        self._loader = None
+        # Re-baseline the guard to the reloaded matrix (its current-P value), so
+        # the *next* roll detects the next change.
+        guard = self._plan.matrix_guard
+        if guard is not None and not guard.is_empty:
+            guard.baseline = guard.affine.compute(P, hinf)
+
     def _push_updates(self, param_values, dirty):
         import highspy
 
@@ -814,6 +1081,26 @@ class FastStepHighs:
                     "(non-parameter-affine) entries; drive the solve from the "
                     "model instead (omit param_values)."
                 )
+
+        # --- value-aware static-matrix guard: never solve a stale matrix ------ #
+        # Re-evaluate the mutable matrix coefficients (vectorized) and compare to
+        # the values HiGHS holds.  Unchanged -> the retained matrix is still
+        # correct, keep the warm basis (the fast path).  Changed -> fail loud, or
+        # (opt-in) reload; never a stale-matrix solve.
+        guard = plan.matrix_guard
+        if guard is not None and not guard.is_empty:
+            current = guard.current(P, hinf)
+            changed = guard.changed_mask(current, self._matrix_atol, self._matrix_rtol)
+            if changed.any():
+                array_mode = param_values is not None
+                if self._on_matrix_change == 'reload' and not array_mode:
+                    # Rebuild + reload the whole standard-form matrix (basis
+                    # reset) for this solve, then continue.  The fresh compile
+                    # bakes in the current matrix *and* data, so the incremental
+                    # push below is skipped.
+                    self._reload_model(P, hinf)
+                    return
+                raise self._matrix_change_error(guard, changed, current, array_mode)
 
         if dirty is not None:
             dirty_cols = np.nonzero(np.asarray(dirty, dtype=bool))[0]

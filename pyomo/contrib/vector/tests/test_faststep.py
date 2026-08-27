@@ -23,8 +23,12 @@ check:
 * the **array (mapping-free) update path** (``solve(param_values=...)``) and the
   **dirty-mask** partial-update path match the model-driven path;
 * the **explicit index-addressed API** (``set_objective_coefficients`` etc.);
-* the scope guards fail loud (nonlinear, mutable matrix coefficient, structure
-  change between solves);
+* the scope guards fail loud (nonlinear, structure change between solves);
+* the **value-aware static-matrix guard**: a nominally-mutable matrix
+  coefficient whose value never changes is accepted and warm-solved (matching a
+  fresh build); a coefficient that genuinely changes trips the guard -- fail-loud
+  by default, or a documented ``on_matrix_change='reload'`` rebuild -- never a
+  stale-matrix solve;
 * residual (non-parameter-affine / fixed-variable) entries stay correct.
 """
 
@@ -108,6 +112,44 @@ def _apply_roll(m, A, T, rng):
         for t in range(T):
             m.dem[a, t] = float(rng.uniform(0.0, 1.0))
             m.pmax[a, t] = float(rng.uniform(3.0, 6.0))
+
+
+# --------------------------------------------------------------------------- #
+# A model whose *constraint matrix* carries a nominally-mutable coefficient:
+# a state-of-charge recurrence with a mutable ``dur`` (interval duration) on the
+# power term -- the private external case's shape.  Under an equal-interval roll
+# ``dur`` never changes (only price/demand move), so the matrix is static in
+# value even though the flag says mutable.
+# --------------------------------------------------------------------------- #
+def _matrix_param_model(dur=1.0, T=4):
+    m = pyo.ConcreteModel()
+    m.T = pyo.RangeSet(0, T - 1)
+    m.dur = pyo.Param(initialize=dur, mutable=True)  # matrix coefficient
+    m.price = pyo.Param(m.T, initialize={t: 1.0 for t in range(T)}, mutable=True)
+    m.dem = pyo.Param(m.T, initialize={t: 0.5 for t in range(T)}, mutable=True)
+    m.p = pyo.Var(m.T, domain=pyo.NonNegativeReals, bounds=(0, 5))
+    m.soc = pyo.Var(m.T, bounds=(0.0, 20.0))
+
+    def socrule(mm, t):
+        if t == 0:
+            return mm.soc[t] == mm.dur * mm.p[t] - mm.dem[t]
+        return mm.soc[t] == mm.soc[t - 1] + mm.dur * mm.p[t] - mm.dem[t]
+
+    m.socc = pyo.Constraint(m.T, rule=socrule)
+    m.obj = pyo.Objective(
+        expr=sum(m.price[t] * m.p[t] for t in range(T))
+        + 0.01 * sum(m.soc[t] for t in range(T)),
+        sense=pyo.minimize,
+    )
+    return m
+
+
+def _roll_matrix_model(m, rng):
+    """An equal-interval roll: prices/demands move, ``dur`` (matrix) stays put."""
+    T = len(m.T)
+    for t in range(T):
+        m.price[t] = float(rng.uniform(0.5, 3.0))
+        m.dem[t] = float(rng.uniform(0.0, 1.0))
 
 
 @unittest.skipUnless(_deps, "highs_faststep requires numpy/scipy/highspy")
@@ -430,7 +472,10 @@ class TestFastStepGuards(unittest.TestCase):
         with self.assertRaises(self.Err):
             FastStepHighs().set_instance(m)
 
-    def test_guard_mutable_matrix_coefficient(self):
+    def test_mutable_matrix_coefficient_accepted(self):
+        # A *nominally* mutable matrix coefficient is no longer rejected at
+        # set_instance: the value guard accepts it (verify-the-values, not
+        # trust-the-flag) and warm-solves while the coefficient stays put.
         from pyomo.contrib.vector import FastStepHighs
 
         m = pyo.ConcreteModel()
@@ -438,8 +483,14 @@ class TestFastStepGuards(unittest.TestCase):
         m.x = pyo.Var([0, 1], domain=pyo.NonNegativeReals, bounds=(0, 10))
         m.c = pyo.Constraint(expr=m.a * m.x[0] + m.x[1] <= 5)
         m.obj = pyo.Objective(expr=m.x[0] + m.x[1], sense=pyo.maximize)
-        with self.assertRaises(self.Err):
-            FastStepHighs().set_instance(m)
+        s = FastStepHighs()
+        s.set_instance(m)  # must NOT raise
+        res = s.solve()
+        from pyomo.contrib.solver.common.results import TerminationCondition
+
+        self.assertEqual(
+            res.termination_condition, TerminationCondition.convergenceCriteriaSatisfied
+        )
 
     def test_guard_structure_change(self):
         from pyomo.contrib.vector import FastStepHighs
@@ -499,6 +550,237 @@ class TestFastStepResidual(unittest.TestCase):
         m.f.fix(3.0)
         s.solve()
         self.assertAlmostEqual(pyo.value(m.x), 2.0, places=6)  # 5 - 3
+
+
+@unittest.skipUnless(_deps, "highs_faststep requires numpy/scipy/highspy")
+class TestFastStepMatrixGuard(unittest.TestCase):
+    """The value-aware static-matrix guard (verify-the-values, not the flag)."""
+
+    def setUp(self):
+        import pyomo.contrib.vector  # noqa: F401
+        from pyomo.contrib.solver.common.results import TerminationCondition
+        from pyomo.contrib.solver.common.util import IncompatibleModelError
+
+        self.TC = TerminationCondition
+        self.Err = IncompatibleModelError
+
+    def test_static_matrix_param_matches_fresh(self):
+        # A mutable matrix coefficient that never changes: the rolling sequence
+        # must match a per-roll fresh build, basis-kept and basis-reset.
+        from pyomo.contrib.vector import FastStepHighs
+
+        for keep_basis in (True, False):
+            m = _matrix_param_model()
+            s = FastStepHighs()
+            s.set_instance(m)
+            s.solve(keep_basis=keep_basis)
+            for roll in range(6):
+                _roll_matrix_model(m, np.random.default_rng(roll))
+                res = s.solve(keep_basis=keep_basis)
+                mref = _matrix_param_model()
+                _roll_matrix_model(mref, np.random.default_rng(roll))
+                rref = _fastload().solve(
+                    mref, raise_exception_on_nonoptimal_result=False
+                )
+                self.assertEqual(
+                    res.termination_condition,
+                    rref.termination_condition,
+                    msg=f"tc mismatch roll {roll} keep_basis={keep_basis}",
+                )
+                if res.termination_condition == self.TC.convergenceCriteriaSatisfied:
+                    self.assertAlmostEqual(
+                        res.incumbent_objective,
+                        rref.incumbent_objective,
+                        delta=1e-6 * max(1.0, abs(rref.incumbent_objective)),
+                        msg=f"obj mismatch roll {roll} keep_basis={keep_basis}",
+                    )
+
+    def test_repeated_identical_roll_never_trips(self):
+        # Exact comparison must not false-positive when the matrix param is
+        # untouched across many solves (M @ P is self-consistent with itself).
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _matrix_param_model()
+        s = FastStepHighs()  # default exact comparison
+        s.set_instance(m)
+        for _ in range(10):
+            res = s.solve()
+            self.assertEqual(
+                res.termination_condition, self.TC.convergenceCriteriaSatisfied
+            )
+
+    def test_matrix_change_fails_loud_by_default(self):
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _matrix_param_model()
+        s = FastStepHighs()
+        s.set_instance(m)
+        s.solve()
+        _roll_matrix_model(m, np.random.default_rng(0))
+        s.solve()  # a static roll still fine
+        m.dur = 2.0  # genuine matrix change
+        with self.assertRaises(self.Err) as ctx:
+            s.solve()
+        msg = str(ctx.exception)
+        self.assertIn("matrix", msg.lower())
+        self.assertIn("dur", msg)  # names the offending Param
+        self.assertIn("socc", msg)  # names the offending constraint
+
+    def test_matrix_change_reload_rebuilds_and_continues(self):
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _matrix_param_model()
+        s = FastStepHighs(on_matrix_change="reload")
+        s.set_instance(m)
+        s.solve()
+        m.dur = 2.0  # genuine matrix change -> reload (basis reset), continue
+        res = s.solve()
+        mref = _matrix_param_model(dur=2.0)
+        rref = _fastload().solve(mref)
+        self.assertEqual(
+            res.termination_condition, self.TC.convergenceCriteriaSatisfied
+        )
+        self.assertAlmostEqual(
+            res.incumbent_objective,
+            rref.incumbent_objective,
+            delta=1e-6 * max(1.0, abs(rref.incumbent_objective)),
+        )
+        # A subsequent static roll still matches a fresh build after the reload.
+        _roll_matrix_model(m, np.random.default_rng(3))
+        res2 = s.solve()
+        mref2 = _matrix_param_model(dur=2.0)
+        _roll_matrix_model(mref2, np.random.default_rng(3))
+        rref2 = _fastload().solve(mref2)
+        self.assertAlmostEqual(
+            res2.incumbent_objective,
+            rref2.incumbent_objective,
+            delta=1e-6 * max(1.0, abs(rref2.incumbent_objective)),
+        )
+
+    def test_matrix_tolerance_accepts_tiny_drift(self):
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _matrix_param_model()
+        s = FastStepHighs(matrix_atol=1e-6)
+        s.set_instance(m)
+        s.solve()
+        m.dur = 1.0 + 1e-9  # within tolerance -> treated as unchanged
+        res = s.solve()  # must not raise
+        self.assertEqual(
+            res.termination_condition, self.TC.convergenceCriteriaSatisfied
+        )
+        m.dur = 1.2  # beyond tolerance -> trips
+        with self.assertRaises(self.Err):
+            s.solve()
+
+    def test_range_constraint_matrix_coefficient(self):
+        # A two-sided (range) row splits into two A-rows sharing the body; a
+        # matrix-coefficient change must be caught on the shared coefficient.
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = pyo.ConcreteModel()
+        m.a = pyo.Param(initialize=2.0, mutable=True)
+        m.x = pyo.Var(domain=pyo.NonNegativeReals, bounds=(0, 10))
+        m.y = pyo.Var(domain=pyo.NonNegativeReals, bounds=(0, 10))
+        m.c = pyo.Constraint(expr=(1.0, m.a * m.x + m.y, 8.0))  # range row
+        m.obj = pyo.Objective(expr=m.x + m.y, sense=pyo.maximize)
+        s = FastStepHighs()
+        s.set_instance(m)
+        s.solve()
+        m.a = 4.0  # matrix change on the range row
+        with self.assertRaises(self.Err):
+            s.solve()
+
+    def test_residual_matrix_coefficient_change_detected(self):
+        # A coefficient that references a *fixed variable* is not affine in the
+        # parameters -> a residual matrix entry evaluated with value() each
+        # solve; the guard still detects a genuine change (here via the fixed
+        # variable's value moving).
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = pyo.ConcreteModel()
+        m.dur = pyo.Param(initialize=1.0, mutable=True)
+        m.zfix = pyo.Var(bounds=(0, 10))
+        m.zfix.fix(1.0)
+        m.x = pyo.Var(domain=pyo.NonNegativeReals, bounds=(0, 10))
+        m.c = pyo.Constraint(expr=(m.dur + m.zfix) * m.x <= 8)  # coef (residual)
+        m.obj = pyo.Objective(expr=m.x, sense=pyo.maximize)
+        s = FastStepHighs()
+        s.set_instance(m)
+        s.solve()
+        self.assertAlmostEqual(pyo.value(m.x), 4.0, places=6)  # 8 / (1 + 1)
+        m.zfix.fix(3.0)  # coefficient (dur + zfix) now 4 -> genuine change
+        with self.assertRaises(self.Err):
+            s.solve()
+
+    def test_reload_handles_coefficient_to_zero_shape_shift(self):
+        # A matrix coefficient rolling to exactly 0.0 drops its A-nonzero (a
+        # matrix *shape* shift); the reload path must rebuild the whole instance
+        # so the mapping stays consistent, and recover when it returns nonzero.
+        from pyomo.contrib.vector import FastStepHighs
+
+        def build(dur):
+            m = pyo.ConcreteModel()
+            m.dur = pyo.Param(initialize=dur, mutable=True)
+            m.x = pyo.Var(domain=pyo.NonNegativeReals, bounds=(0, 10))
+            m.y = pyo.Var(domain=pyo.NonNegativeReals, bounds=(0, 10))
+            m.c = pyo.Constraint(expr=m.dur * m.x + m.y == 5)
+            m.d = pyo.Constraint(expr=m.x + m.y >= 1)
+            m.obj = pyo.Objective(expr=m.x + 2 * m.y, sense=pyo.minimize)
+            return m
+
+        m = build(1.0)
+        s = FastStepHighs(on_matrix_change="reload")
+        s.set_instance(m)
+        s.solve()
+        for dur in (0.0, 2.0):  # nonzero -> zero (drop) -> nonzero (add)
+            m.dur = dur
+            res = s.solve()
+            rref = _fastload().solve(build(dur))
+            self.assertAlmostEqual(
+                res.incumbent_objective,
+                rref.incumbent_objective,
+                delta=1e-6 * max(1.0, abs(rref.incumbent_objective)),
+            )
+
+    def test_bilinear_param_coefficient_rejected(self):
+        # A coefficient bilinear in the parameters (p*q) is genuinely nonlinear
+        # in P; the affine self-check cannot reproduce it under perturbation, so
+        # the model is rejected loudly (never templated wrong).
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = pyo.ConcreteModel()
+        m.p = pyo.Param(initialize=2.0, mutable=True)
+        m.q = pyo.Param(initialize=1.0, mutable=True)
+        m.x = pyo.Var(domain=pyo.NonNegativeReals, bounds=(0, 10))
+        m.c = pyo.Constraint(expr=m.p * m.q * m.x <= 8)
+        m.obj = pyo.Objective(expr=m.x, sense=pyo.maximize)
+        with self.assertRaises(self.Err):
+            FastStepHighs().set_instance(m)
+
+    def test_array_mode_matrix_change_errors_even_with_reload(self):
+        # The array-driven path cannot reload from the model, so a matrix change
+        # is always fatal there -- even under on_matrix_change='reload'.
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _matrix_param_model()
+        s = FastStepHighs(on_matrix_change="reload")
+        s.set_instance(m)
+        params = s.parameters
+        s.solve()
+        m.dur = 2.0  # matrix param changed in the model
+        P = np.fromiter((p.value for p in params), float, len(params))
+        with self.assertRaises(self.Err):
+            s.solve(param_values=P)
+
+    def test_invalid_on_matrix_change(self):
+        from pyomo.contrib.vector import FastStepHighs
+
+        with self.assertRaises(ValueError):
+            FastStepHighs(on_matrix_change="bogus")
+        m = _matrix_param_model()
+        with self.assertRaises(ValueError):
+            FastStepHighs().set_instance(m, on_matrix_change="bogus")
 
 
 if __name__ == "__main__":

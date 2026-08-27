@@ -19,8 +19,17 @@ times and times, per roll, the **warm tick** -- the update + re-solve -- for:
   ``changeColsBounds`` per group, warm basis kept.
 * **faststep_array** -- the same, driven from a raw parameter-value array
   (``solve(param_values=P)``): the mapping-free path a private integration feeds.
+* **faststep_valueguard** -- the value-aware static-matrix guard leg.  The model
+  is rebuilt with a *nominally-mutable* constraint-matrix coefficient
+  (``eff[a,t]`` on the state-of-charge recurrence) whose value never changes
+  under the equal-interval roll.  The pre-guard interface rejected such a model
+  outright; the value guard now accepts it, verifies the matrix is unchanged each
+  roll (one vectorized ``M @ P`` + compare), and keeps the warm basis.  The table
+  reports this leg's warm tick alongside the per-roll guard-check overhead and
+  its ratio to the pure-static ``faststep_model`` tick (target: guard overhead
+  ``< 10%`` of the warm tick; leg within ``~10%`` of the static path).
 
-Every roll's objective is checked equal across all three routes (the warm-solve
+Every roll's objective is checked equal across all routes (the warm-solve
 equivalence gate).  The table reports the median warm tick and the faststep
 speedup; the exit target is ``faststep_model >= 1.4x`` the APPSI route at the
 ``1e5`` size.
@@ -129,16 +138,52 @@ def run_size(size: str, dims: Dict[str, Any], rolls: int, seed0: int) -> Dict[st
         fa_ticks.append(time.perf_counter() - t0)
         fa_objs.append(res.incumbent_objective)
 
+    # ----- faststep, value-guard leg (nominally-mutable static matrix) ------- #
+    # The model carries a mutable matrix coefficient (eff[a,t]) that never
+    # changes under the roll; the value guard accepts it, verifies it each roll,
+    # and keeps the warm basis.  We also time the guard check in isolation.
+    import highspy
+
+    hinf = highspy.kHighsInf
+    m_v = rolling_mpc.build_pyomo(dims, mutable_matrix=True)
+    vg = FastStepHighs()
+    vg.set_instance(m_v)
+    vg.solve()
+    guard = vg._plan.matrix_guard  # the _MatrixGuard component
+    n_guarded = int(guard.affine.n)
+    vg_ticks = []
+    vg_objs = []
+    guard_ticks = []
+    for r in range(rolls):
+        rolling_mpc.apply_roll(m_v, np.random.default_rng(seed0 + r))
+        t0 = time.perf_counter()
+        res = vg.solve()
+        vg_ticks.append(time.perf_counter() - t0)
+        vg_objs.append(res.incumbent_objective)
+        # Isolated guard-check cost: exactly the per-roll verification work.
+        P = vg._plan.read_param_vector()
+        g0 = time.perf_counter()
+        cur = guard.current(P, hinf)
+        guard.changed_mask(cur, vg._matrix_atol, vg._matrix_rtol)
+        guard_ticks.append(time.perf_counter() - g0)
+
     # ----- equivalence gate ------------------------------------------------- #
     max_obj_dev = 0.0
-    for oa, of, og in zip(appsi_objs, fs_objs, fa_objs):
+    for oa, of, og, ov in zip(appsi_objs, fs_objs, fa_objs, vg_objs):
         scale = max(1.0, abs(oa))
-        max_obj_dev = max(max_obj_dev, abs(of - oa) / scale, abs(og - oa) / scale)
+        max_obj_dev = max(
+            max_obj_dev,
+            abs(of - oa) / scale,
+            abs(og - oa) / scale,
+            abs(ov - oa) / scale,
+        )
     equivalent = max_obj_dev < 1e-6
 
     appsi_ms = _median_ms(appsi_ticks)
     fs_ms = _median_ms(fs_ticks)
     fa_ms = _median_ms(fa_ticks)
+    vg_ms = _median_ms(vg_ticks)
+    guard_ms = _median_ms(guard_ticks)
     return {
         "size": size,
         "A": dims["A"],
@@ -150,6 +195,11 @@ def run_size(size: str, dims: Dict[str, Any], rolls: int, seed0: int) -> Dict[st
         "appsi_persistent_ms": appsi_ms,
         "faststep_model_ms": fs_ms,
         "faststep_array_ms": fa_ms,
+        "faststep_valueguard_ms": vg_ms,
+        "guard_check_ms": guard_ms,
+        "guard_overhead_frac": guard_ms / vg_ms if vg_ms else None,
+        "valueguard_vs_static": vg_ms / fs_ms if fs_ms else None,
+        "n_guarded_coeffs": n_guarded,
         "speedup_model": appsi_ms / fs_ms if fs_ms else None,
         "speedup_array": appsi_ms / fa_ms if fa_ms else None,
         "max_obj_deviation": max_obj_dev,
@@ -178,6 +228,26 @@ def render_table(rows: List[Dict[str, Any]]) -> str:
     return "\n".join(out)
 
 
+def render_guard_table(rows: List[Dict[str, Any]]) -> str:
+    """The value-aware static-matrix guard evidence (the new leg)."""
+    out = []
+    out.append(
+        "| size | guarded A-coeffs | faststep (static) | faststep (value-guard) | "
+        "guard-check | guard overhead | leg vs static |"
+    )
+    out.append("|---|---|---|---|---|---|---|")
+    for r in rows:
+        out.append(
+            f"| {r['size']} | {r['n_guarded_coeffs']:,} | "
+            f"{r['faststep_model_ms']:.2f} ms | "
+            f"{r['faststep_valueguard_ms']:.2f} ms | "
+            f"{r['guard_check_ms']:.3f} ms | "
+            f"{100.0 * r['guard_overhead_frac']:.1f}% | "
+            f"{r['valueguard_vs_static']:.2f}x |"
+        )
+    return "\n".join(out)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--sizes", default="1e4,1e5")
@@ -201,11 +271,18 @@ def main():
             f"[{size}] nnz={row['nnz']:,} | APPSI {row['appsi_persistent_ms']:.2f} ms"
             f" | faststep model {row['faststep_model_ms']:.2f} ms"
             f" ({row['speedup_model']:.2f}x) | array {row['faststep_array_ms']:.2f} ms"
-            f" ({row['speedup_array']:.2f}x) | equivalent={row['equivalent']}",
+            f" ({row['speedup_array']:.2f}x) | value-guard "
+            f"{row['faststep_valueguard_ms']:.2f} ms (guard "
+            f"{100.0 * row['guard_overhead_frac']:.1f}% of tick, "
+            f"{row['valueguard_vs_static']:.2f}x static) | "
+            f"equivalent={row['equivalent']}",
             flush=True,
         )
 
-    print("\n" + render_table(rows) + "\n")
+    print("\n### warm tick vs APPSI-persistent\n")
+    print(render_table(rows))
+    print("\n### value-aware static-matrix guard\n")
+    print(render_guard_table(rows) + "\n")
 
     if a.out:
         with open(a.out, "w") as fh:
