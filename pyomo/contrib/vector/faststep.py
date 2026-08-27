@@ -65,6 +65,41 @@ optionally with a ``dirty`` boolean mask marking which parameters changed.
 :class:`FastStepHighs` owns the LP row/column mapping and the coefficient
 templates internally, so this mapping never has to live on the caller side.
 
+Masked warm updates (rolling-window narrowing)
+----------------------------------------------
+A rolling-horizon MPC often re-solves over a *sliding window* of the horizon:
+each cycle only a window ``[a, b)`` is active, with the state at the window's edge
+held at the current measurement.  Narrowing the model *structurally* -- a fresh,
+smaller matrix each cycle -- discards the warm basis, re-pays construction, and is
+exactly the row/column change the structure fingerprint rejects.
+
+:class:`FastStepHighs` instead narrows with a **solver-side overlay** on top of the
+templated data, so the matrix (and thus the fingerprint, the value guard, and the
+fold set) is untouched and the whole update rides the warm path:
+
+* :meth:`deactivate_rows` / :meth:`activate_rows` (or :meth:`set_active_rows`) --
+  **mask** constraint rows off by relaxing them to ``-inf <= . <= +inf`` (a free
+  row imposes nothing; ``changeRowsBounds``), the warm-basis-friendly equivalent
+  of the narrowed problem dropping the row;
+* :meth:`fix_variables` / :meth:`unfix_variables` (or :meth:`set_fixed_variables`)
+  -- **fix** variables to given values via equal bounds ``(v, v)``
+  (``changeColsBounds``);
+* :meth:`set_window` sets both at once (boolean masks + a fix-value array) and
+  :meth:`clear_window` restores the full model.
+
+On the active window this is *exactly* the structurally-narrowed problem: an
+in-window row that references a fixed out-of-window variable becomes the correct
+boundary condition (the fixed value moves to the row's RHS), and a relaxed
+out-of-window row is the row the narrowed problem drops.  The overlay is pushed as
+a **delta** between solves (only the rows/columns whose mask/fix state changed),
+composes with the templated data roll and the array-driven path, and survives an
+``on_matrix_change='reload'`` rebuild.  A fixed variable keeps its objective
+coefficient, so it contributes the constant ``c_j * value`` to the reported
+objective; :meth:`masked_objective_constant` returns that constant so
+``reported - constant`` is the pure in-window cost.  The window API is array-first
+(plain int / bool arrays), so an adapter drives it with no Pyomo mutation on the
+hot path.
+
 Change-detection contract
 -------------------------
 ``set_instance`` walks the objective and every constraint **once** with the same
@@ -152,7 +187,9 @@ Scope (fail loud, never a stale-matrix solve)
 * Supported warm updates: **objective coefficients, objective offset, constraint
   (row) bounds / RHS, and variable bounds**, all driven by mutable ``Param``
   values (or fixed-variable values).  This is exactly the rolling-horizon roll:
-  prices move the objective, forecasts/limits move the RHS and bounds.
+  prices move the objective, forecasts/limits move the RHS and bounds.  Plus
+  **row masks and variable fixes** (the masked-warm-updates section above): a
+  solver-side overlay that narrows the active window without a structural change.
 * **Constraint-matrix coefficients are value-guarded, not assumed static.**  A
   mutable matrix coefficient is accepted (see the value-guard section above); a
   coefficient that stays put warm-solves on the kept basis, one that genuinely
@@ -1619,6 +1656,31 @@ class FastStepHighs:
         self._on_matrix_change = self._check_matrix_policy(on_matrix_change)
         self._matrix_atol = float(matrix_atol)
         self._matrix_rtol = float(matrix_rtol)
+        # --- masked warm updates (row masks / variable fixes) ----------------- #
+        # A solver-side overlay on top of the template-driven bounds, so a
+        # rolling-horizon MPC can narrow its *active window* between solves
+        # WITHOUT a structural change (the matrix, and thus the fingerprint /
+        # value-guard / fold set, are untouched).  ``_overlay_active`` stays False
+        # until the first mask/fix call, so a model that never masks/fixes takes
+        # the exact pre-overlay push path.  See :meth:`deactivate_rows` /
+        # :meth:`fix_variables` and the module docstring's masking section.
+        self._overlay_active = False
+        self._row_active = None  # bool[n_row]; True == constraint row enforced
+        self._col_fixed = None  # bool[n_col]; True == column pinned to a value
+        self._col_fix_val = None  # float[n_col]; the pin value where _col_fixed
+        # What HiGHS currently reflects (to push only the mask/fix *delta*).
+        self._row_active_pushed = None
+        self._col_fixed_pushed = None
+        self._col_fix_val_pushed = None
+        # The data-driven (template/baseline) bounds WITHOUT the overlay, in HiGHS
+        # infinity terms -- what a row/column is restored to when re-activated /
+        # un-fixed.  Built lazily when the overlay is first engaged, then
+        # maintained incrementally by each template push.
+        self._eff_row_lower = None
+        self._eff_row_upper = None
+        self._eff_col_lower = None
+        self._eff_col_upper = None
+        self._cur_cost = None  # current objective coefficients (for the constant)
 
     @classmethod
     def _check_matrix_policy(cls, policy):
@@ -1720,7 +1782,28 @@ class FastStepHighs:
         self._col_map = None
         self._fingerprint = _structure_fingerprint(model)
         self._n_solves = 0
+        self._init_overlay_state()
         return self
+
+    def _init_overlay_state(self):
+        """Reset the row-mask / variable-fix overlay to *nothing masked or fixed*
+        (HiGHS was just loaded with the baseline matrix, so every row is active and
+        no column is pinned).  Allocated at :meth:`set_instance` size; the ``_eff``
+        restore arrays stay ``None`` until the overlay is first engaged."""
+        n_row = self._compiled.n_row
+        n_col = self._compiled.n_col
+        self._overlay_active = False
+        self._row_active = np.ones(n_row, dtype=bool)
+        self._col_fixed = np.zeros(n_col, dtype=bool)
+        self._col_fix_val = np.zeros(n_col, dtype=np.float64)
+        self._row_active_pushed = np.ones(n_row, dtype=bool)
+        self._col_fixed_pushed = np.zeros(n_col, dtype=bool)
+        self._col_fix_val_pushed = np.zeros(n_col, dtype=np.float64)
+        self._eff_row_lower = None
+        self._eff_row_upper = None
+        self._eff_col_lower = None
+        self._eff_col_upper = None
+        self._cur_cost = None
 
     def _apply_config_options(self, highs):
         config = self.config
@@ -1765,7 +1848,9 @@ class FastStepHighs:
             Re-extract the model's mutable data and batch-push it before solving
             (the default).  Set ``False`` when the solver state has already been
             updated out of band (e.g. via :meth:`set_objective_coefficients`) and
-            no further model re-extraction is wanted.
+            no further model re-extraction is wanted.  A pending row-mask /
+            variable-fix delta (see :meth:`set_window`) is still pushed even when
+            ``update=False`` -- the overlay is state on the stepper, not the model.
         param_values : array-like, optional
             The parameter vector ``P`` (ordered by :attr:`parameters`) to use
             *instead of* reading the model.  Lets a caller drive the solve from
@@ -1783,6 +1868,10 @@ class FastStepHighs:
         timer = HierarchicalTimer()
         ostreams = [io.StringIO()] + list(self.config.tee)
 
+        # A pending mask/fix delta must be pushed even when ``update=False`` (the
+        # caller narrowed the window out of band and does not want a model
+        # re-extraction): push the overlay only, leaving the templated data as is.
+        overlay_pending = self._overlay_active and self._overlay_dirty()
         try:
             with capture_output(TeeStream(*ostreams), capture_fd=True):
                 if (
@@ -1792,9 +1881,9 @@ class FastStepHighs:
                     and param_values is None
                 ):
                     self._check_structure()
-                if do_update:
+                if do_update or overlay_pending:
                     timer.start('update')
-                    self._push_updates(param_values, dirty)
+                    self._push_updates(param_values, dirty, push_data=do_update)
                     timer.stop('update')
                 if not keep_basis:
                     self._highs.clearSolver()
@@ -1890,8 +1979,13 @@ class FastStepHighs:
         (basis reset).  Used when a *folded* (verified-static) parameter genuinely
         changed under ``on_matrix_change='reload'`` -- the templates themselves
         must change (a re-fold), so the lighter matrix-only :meth:`_reload_model`
-        is not enough."""
-        self.set_instance(self._model)
+        is not enough.  Any live row-mask / variable-fix overlay is preserved
+        across the rebuild (it is index-addressed and the structure is unchanged).
+        """
+        saved = self._snapshot_overlay()
+        self.set_instance(self._model)  # resets the overlay to nothing
+        if saved is not None:
+            self._restore_overlay(saved)
 
     def _reload_model(self, P, hinf):
         """Rebuild + reload the whole matrix (the ``on_matrix_change='reload'``
@@ -1910,7 +2004,7 @@ class FastStepHighs:
             or compiled.n_row != self._compiled.n_row
             or compiled.nnz != self._compiled.nnz
         ):
-            self.set_instance(self._model)
+            self._reload_full()
             return
         lp = build_highs_model(compiled)  # HighsModel (with Hessian) for a QP
         self._highs.passModel(lp)
@@ -1921,13 +2015,201 @@ class FastStepHighs:
         guard = self._plan.matrix_guard
         if guard is not None and not guard.is_empty:
             guard.baseline = guard.affine.compute(P, hinf)
+        # passModel reset HiGHS to the compiled baseline bounds, dropping every
+        # mask/fix.  Re-baseline the ``_eff`` restore arrays to the fresh compile
+        # and re-apply the whole overlay so the reloaded matrix still reflects the
+        # narrowed window.
+        if self._overlay_active:
+            self._recompute_eff()
+            self._row_active_pushed = np.ones(compiled.n_row, dtype=bool)
+            self._col_fixed_pushed = np.zeros(compiled.n_col, dtype=bool)
+            self._col_fix_val_pushed = np.zeros(compiled.n_col, dtype=np.float64)
+            self._push_overlay(self._highs, hinf)
 
-    def _push_updates(self, param_values, dirty):
+    # ------------------------------------------------------------------ #
+    # masked warm updates -- the row-mask / variable-fix overlay
+    # ------------------------------------------------------------------ #
+    def _recompute_eff(self):
+        """Rebuild the ``_eff`` restore arrays (data-driven bounds without the
+        overlay, in HiGHS-infinity terms) and ``_cur_cost`` from the compiled
+        baseline overlaid with the templates at the model's current ``P``.  Called
+        when the overlay is first engaged and after a reload."""
+        import highspy
+
+        hinf = highspy.kHighsInf
+        compiled = self._compiled
+        plan = self._plan
+        self._eff_row_lower = _finite(compiled.row_lower, hinf)
+        self._eff_row_upper = _finite(compiled.row_upper, hinf)
+        self._eff_col_lower = _finite(compiled.col_lower, hinf)
+        self._eff_col_upper = _finite(compiled.col_upper, hinf)
+        self._cur_cost = np.array(compiled.c, dtype=np.float64)
+        P = plan.read_param_vector()
+        if len(plan.row_idx):
+            self._eff_row_lower[plan.row_idx] = plan.row_lower_affine.compute(P, hinf)
+            self._eff_row_upper[plan.row_idx] = plan.row_upper_affine.compute(P, hinf)
+        if len(plan.col_idx):
+            self._eff_col_lower[plan.col_idx] = plan.col_lower_affine.compute(P, hinf)
+            self._eff_col_upper[plan.col_idx] = plan.col_upper_affine.compute(P, hinf)
+        if len(plan.obj_cols):
+            self._cur_cost[plan.obj_cols] = plan.obj_affine.compute(P, hinf)
+
+    def _engage_overlay(self):
+        """Turn the overlay on the first time a mask/fix is requested, building the
+        ``_eff`` restore arrays.  A model that never masks/fixes never pays this."""
+        self._require_loaded()
+        if not self._overlay_active:
+            self._recompute_eff()
+            self._overlay_active = True
+
+    def _overlay_dirty(self):
+        """Whether the mask/fix state differs from what HiGHS currently reflects."""
+        if not self._overlay_active:
+            return False
+        if not np.array_equal(self._row_active, self._row_active_pushed):
+            return True
+        if not np.array_equal(self._col_fixed, self._col_fixed_pushed):
+            return True
+        fixed = self._col_fixed
+        return bool(
+            fixed.any()
+            and not np.array_equal(
+                self._col_fix_val[fixed], self._col_fix_val_pushed[fixed]
+            )
+        )
+
+    def _snapshot_overlay(self):
+        """A copy of the overlay state (for save/restore across a full reload), or
+        ``None`` when the overlay is not engaged."""
+        if not self._overlay_active:
+            return None
+        return {
+            'n_row': self._compiled.n_row,
+            'n_col': self._compiled.n_col,
+            'row_active': self._row_active.copy(),
+            'col_fixed': self._col_fixed.copy(),
+            'col_fix_val': self._col_fix_val.copy(),
+        }
+
+    def _restore_overlay(self, saved):
+        """Re-apply a snapshot after ``set_instance`` rebuilt the instance.  The
+        masks are index-addressed, so they are only valid when the reloaded shape
+        matches; a shape change drops them (with a warning)."""
+        import highspy
+
+        if saved['n_row'] != self._compiled.n_row or (
+            saved['n_col'] != self._compiled.n_col
+        ):
+            logger.warning(
+                "'%s': a reload changed the matrix shape, so the active row-mask / "
+                "variable-fix window was dropped (masks and fixes are "
+                "index-addressed).  Re-apply the window after the reload.",
+                self.name,
+            )
+            return
+        self._row_active = saved['row_active']
+        self._col_fixed = saved['col_fixed']
+        self._col_fix_val = saved['col_fix_val']
+        self._engage_overlay()  # active + fresh _eff off the reloaded compile
+        # set_instance loaded the baseline (all active, none fixed); the pushed
+        # snapshots already reflect that, so _push_overlay applies the full window.
+        self._push_overlay(self._highs, highspy.kHighsInf)
+
+    def _emit_row_bounds(self, highs, idx, lo, up):
+        """Push row bounds for solver rows ``idx``, recording them in ``_eff`` and
+        skipping any row currently masked off (the overlay owns those)."""
+        if self._overlay_active:
+            self._eff_row_lower[idx] = lo
+            self._eff_row_upper[idx] = up
+            active = self._row_active[idx]
+            if not active.all():
+                if not active.any():
+                    return
+                sel = np.nonzero(active)[0]
+                idx, lo, up = idx[sel], lo[sel], up[sel]
+        highs.changeRowsBounds(len(idx), np.ascontiguousarray(idx), lo, up)
+
+    def _emit_col_bounds(self, highs, idx, lo, up):
+        """Push variable bounds for solver columns ``idx``, recording them in
+        ``_eff`` and skipping any column currently fixed (the overlay owns those)."""
+        if self._overlay_active:
+            self._eff_col_lower[idx] = lo
+            self._eff_col_upper[idx] = up
+            free = ~self._col_fixed[idx]
+            if not free.all():
+                if not free.any():
+                    return
+                sel = np.nonzero(free)[0]
+                idx, lo, up = idx[sel], lo[sel], up[sel]
+        highs.changeColsBounds(len(idx), np.ascontiguousarray(idx), lo, up)
+
+    def _emit_cost(self, highs, cols, costs):
+        """Push objective coefficients for solver columns ``cols`` (a fixed column
+        keeps its cost -- it still contributes the constant ``c_j * value``)."""
+        if self._overlay_active:
+            self._cur_cost[cols] = costs
+        highs.changeColsCost(len(cols), cols, costs)
+
+    def _push_overlay(self, highs, hinf):
+        """Push the mask/fix *delta* since the last solve: relax newly-masked rows
+        to free / restore reactivated rows to their data bound, and pin newly-fixed
+        columns to ``(v, v)`` / release un-fixed columns to their data bound.  The
+        matrix is untouched, so the warm basis is kept where HiGHS allows."""
+        if not self._overlay_active:
+            return
+        ra = self._row_active
+        rap = self._row_active_pushed
+        if not np.array_equal(ra, rap):
+            relax = np.nonzero(rap & ~ra)[0].astype(np.int32)
+            restore = np.nonzero(ra & ~rap)[0].astype(np.int32)
+            if relax.size:
+                neg = np.full(relax.size, -hinf, dtype=np.float64)
+                pos = np.full(relax.size, hinf, dtype=np.float64)
+                highs.changeRowsBounds(int(relax.size), relax, neg, pos)
+            if restore.size:
+                highs.changeRowsBounds(
+                    int(restore.size),
+                    restore,
+                    np.ascontiguousarray(self._eff_row_lower[restore]),
+                    np.ascontiguousarray(self._eff_row_upper[restore]),
+                )
+            self._row_active_pushed = ra.copy()
+        cf = self._col_fixed
+        cfp = self._col_fixed_pushed
+        fv = self._col_fix_val
+        fvp = self._col_fix_val_pushed
+        # A column needs a push when it is newly fixed, its pin value moved, or it
+        # was released; ``cf`` gates the value compare so released slots never fire.
+        newfix = cf & (~cfp | (fv != fvp))
+        unfix = cfp & ~cf
+        if newfix.any() or unfix.any():
+            fi = np.nonzero(newfix)[0].astype(np.int32)
+            ui = np.nonzero(unfix)[0].astype(np.int32)
+            if fi.size:
+                vals = np.ascontiguousarray(fv[fi])
+                highs.changeColsBounds(int(fi.size), fi, vals, vals)
+            if ui.size:
+                highs.changeColsBounds(
+                    int(ui.size),
+                    ui,
+                    np.ascontiguousarray(self._eff_col_lower[ui]),
+                    np.ascontiguousarray(self._eff_col_upper[ui]),
+                )
+            self._col_fixed_pushed = cf.copy()
+            self._col_fix_val_pushed = fv.copy()
+
+    def _push_updates(self, param_values, dirty, push_data=True):
         import highspy
 
         hinf = highspy.kHighsInf
         highs = self._highs
         plan = self._plan
+
+        if not push_data:
+            # An overlay-only push (``update=False`` with a pending mask/fix
+            # delta): leave the templated data untouched, apply the overlay only.
+            self._push_overlay(highs, hinf)
+            return
 
         if param_values is None:
             P = plan.read_param_vector()
@@ -1964,7 +2246,7 @@ class FastStepHighs:
                     # Re-classify folds at the new values, rebuild the templates,
                     # and load a fresh model (basis reset) for this solve.  The
                     # fresh compile bakes in the current data, so the incremental
-                    # push below is skipped.
+                    # push below is skipped (the overlay is re-applied by reload).
                     self._reload_full()
                     return
                 raise self._folded_change_error(plan, fchanged, fcur, array_mode)
@@ -1984,7 +2266,7 @@ class FastStepHighs:
                     # Rebuild + reload the whole standard-form matrix (basis
                     # reset) for this solve, then continue.  The fresh compile
                     # bakes in the current matrix *and* data, so the incremental
-                    # push below is skipped.
+                    # push below is skipped (the overlay is re-applied by reload).
                     self._reload_model(P, hinf)
                     return
                 raise self._matrix_change_error(guard, changed, current, array_mode)
@@ -1992,12 +2274,13 @@ class FastStepHighs:
         if dirty is not None:
             dirty_cols = np.nonzero(np.asarray(dirty, dtype=bool))[0]
             self._push_dirty(highs, plan, P, hinf, dirty_cols)
+            self._push_overlay(highs, hinf)
             return
 
         # objective coefficients
         if len(plan.obj_cols):
             costs = plan.obj_affine.compute(P, hinf)
-            highs.changeColsCost(len(plan.obj_cols), plan.obj_cols, costs)
+            self._emit_cost(highs, plan.obj_cols, costs)
         if plan.obj_offset_affine is not None:
             highs.changeObjectiveOffset(
                 float(plan.obj_offset_affine.compute(P, hinf)[0])
@@ -2006,12 +2289,16 @@ class FastStepHighs:
         if len(plan.row_idx):
             lo = plan.row_lower_affine.compute(P, hinf)
             up = plan.row_upper_affine.compute(P, hinf)
-            highs.changeRowsBounds(len(plan.row_idx), plan.row_idx, lo, up)
+            self._emit_row_bounds(highs, plan.row_idx, lo, up)
         # variable bounds
         if len(plan.col_idx):
             lo = plan.col_lower_affine.compute(P, hinf)
             up = plan.col_upper_affine.compute(P, hinf)
-            highs.changeColsBounds(len(plan.col_idx), plan.col_idx, lo, up)
+            self._emit_col_bounds(highs, plan.col_idx, lo, up)
+
+        # mask/fix overlay -- applied after the templated data so a masked row / a
+        # fixed column wins over its data bound (no-op when the overlay is unused).
+        self._push_overlay(highs, hinf)
 
     def _push_dirty(self, highs, plan, P, hinf, dirty_cols):
         # objective coefficients
@@ -2019,7 +2306,7 @@ class FastStepHighs:
             rows = plan.obj_affine.affected_rows(dirty_cols)
             if len(rows):
                 vals = plan.obj_affine.compute_rows(rows, P, hinf)
-                highs.changeColsCost(len(rows), plan.obj_cols[rows], vals)
+                self._emit_cost(highs, plan.obj_cols[rows], vals)
         if plan.obj_offset_affine is not None:
             if len(plan.obj_offset_affine.affected_rows(dirty_cols)):
                 highs.changeObjectiveOffset(
@@ -2034,7 +2321,7 @@ class FastStepHighs:
             if len(rows):
                 lo = plan.row_lower_affine.compute_rows(rows, P, hinf)
                 up = plan.row_upper_affine.compute_rows(rows, P, hinf)
-                highs.changeRowsBounds(len(rows), plan.row_idx[rows], lo, up)
+                self._emit_row_bounds(highs, plan.row_idx[rows], lo, up)
         # variable bounds
         if len(plan.col_idx):
             rows = np.union1d(
@@ -2044,7 +2331,7 @@ class FastStepHighs:
             if len(rows):
                 lo = plan.col_lower_affine.compute_rows(rows, P, hinf)
                 up = plan.col_upper_affine.compute_rows(rows, P, hinf)
-                highs.changeColsBounds(len(rows), plan.col_idx[rows], lo, up)
+                self._emit_col_bounds(highs, plan.col_idx[rows], lo, up)
 
     # ------------------------------------------------------------------ #
     # parameter-vector introspection (the array/mapping-free contract)
@@ -2155,6 +2442,197 @@ class FastStepHighs:
         self._require_loaded()
         want = id(con)
         return [i for i, (c, _m) in enumerate(self._compiled.rows) if id(c) == want]
+
+    # ------------------------------------------------------------------ #
+    # masked warm updates -- narrow the active window without a rebuild
+    # ------------------------------------------------------------------ #
+    # A rolling-horizon MPC re-solves the same model over a *sliding window* of
+    # the horizon.  Structurally narrowing the model each cycle (a fresh, smaller
+    # matrix) throws away the warm basis and re-pays construction.  Instead, keep
+    # the full compiled matrix and, between solves, **mask** the out-of-window
+    # constraint rows (relax them to free so they impose nothing) and **fix** the
+    # out-of-window variables (pin them to the boundary/initial-condition values).
+    # On the active window this is *exactly* the structurally-narrowed problem:
+    # an in-window row that references a fixed out-of-window variable becomes the
+    # correct boundary condition (the fixed value moves to the row's RHS), and a
+    # relaxed out-of-window row is the row the narrowed problem drops.  The matrix
+    # -- and thus the structure fingerprint, the value guard, and the fold set --
+    # is untouched, so the whole update rides the warm path.  Masks/fixes are
+    # index-addressed (plain int / bool arrays) so an adapter can drive them
+    # without touching the Pyomo model; ``column_index`` / ``row_indices`` map
+    # from Pyomo components when needed.
+    def deactivate_rows(self, rows):
+        """Mask constraint rows **off** for subsequent warm solves: each listed
+        solver row is relaxed to ``-inf <= . <= +inf`` (it imposes nothing), the
+        warm-basis-friendly equivalent of the narrowed problem dropping the row.
+        ``rows`` is an array of solver row indices (see :meth:`row_indices`)."""
+        self._engage_overlay()
+        rows = self._as_index_array(rows, self._compiled.n_row, 'row')
+        self._row_active[rows] = False
+        return self
+
+    def activate_rows(self, rows):
+        """Re-activate previously-masked constraint rows: restore each listed
+        solver row to its current data-driven (template/baseline) bounds."""
+        self._engage_overlay()
+        rows = self._as_index_array(rows, self._compiled.n_row, 'row')
+        self._row_active[rows] = True
+        return self
+
+    def set_active_rows(self, mask):
+        """Set the full row-activity mask at once (a length-``n_row`` boolean;
+        ``True`` == the row is enforced, ``False`` == relaxed to free)."""
+        self._engage_overlay()
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != (self._compiled.n_row,):
+            raise ValueError(
+                f"active-rows mask has shape {mask.shape} but the model has "
+                f"{self._compiled.n_row} rows."
+            )
+        self._row_active[:] = mask
+        return self
+
+    @property
+    def active_rows(self):
+        """The current length-``n_row`` boolean row-activity mask (a copy)."""
+        self._require_loaded()
+        if self._row_active is None:
+            return np.ones(self._compiled.n_row, dtype=bool)
+        return self._row_active.copy()
+
+    def fix_variables(self, cols, values):
+        """Fix variables **to given values** for subsequent warm solves: each
+        listed solver column is pinned via equal bounds ``(v, v)``.  ``cols`` is an
+        array of solver column indices (see :meth:`column_index`); ``values`` is a
+        scalar or an array broadcastable to ``cols``.  The column keeps its
+        objective coefficient, so a fixed variable contributes the constant
+        ``c_j * v`` to the reported objective (see :meth:`masked_objective_constant`).
+        """
+        self._engage_overlay()
+        cols = self._as_index_array(cols, self._compiled.n_col, 'column')
+        values = np.asarray(values, dtype=np.float64)
+        try:
+            values = np.broadcast_to(values, cols.shape)
+        except ValueError:
+            raise ValueError(
+                f"fix values shape {values.shape} is not broadcastable to "
+                f"{cols.shape} column(s)."
+            )
+        self._col_fixed[cols] = True
+        self._col_fix_val[cols] = values
+        return self
+
+    def unfix_variables(self, cols):
+        """Release previously-fixed variables: restore each listed solver column to
+        its current data-driven (template/baseline) bounds."""
+        self._engage_overlay()
+        cols = self._as_index_array(cols, self._compiled.n_col, 'column')
+        self._col_fixed[cols] = False
+        return self
+
+    def set_fixed_variables(self, mask, values):
+        """Set the full variable-fix state at once: ``mask`` is a length-``n_col``
+        boolean (``True`` == fixed) and ``values`` a length-``n_col`` array of pin
+        values (only the ``True`` entries are used)."""
+        self._engage_overlay()
+        mask = np.asarray(mask, dtype=bool)
+        values = np.asarray(values, dtype=np.float64)
+        n_col = self._compiled.n_col
+        if mask.shape != (n_col,):
+            raise ValueError(
+                f"fixed mask has shape {mask.shape} but the model has {n_col} columns."
+            )
+        if values.shape != (n_col,):
+            raise ValueError(
+                f"fixed values has shape {values.shape} but the model has "
+                f"{n_col} columns."
+            )
+        self._col_fixed[:] = mask
+        self._col_fix_val[:] = np.where(mask, values, self._col_fix_val)
+        return self
+
+    @property
+    def fixed_variables_mask(self):
+        """The current length-``n_col`` boolean fixed-variable mask (a copy)."""
+        self._require_loaded()
+        if self._col_fixed is None:
+            return np.zeros(self._compiled.n_col, dtype=bool)
+        return self._col_fixed.copy()
+
+    @property
+    def fixed_values(self):
+        """The current length-``n_col`` pin values (meaningful where fixed; a copy)."""
+        self._require_loaded()
+        if self._col_fix_val is None:
+            return np.zeros(self._compiled.n_col, dtype=np.float64)
+        return self._col_fix_val.copy()
+
+    def set_window(self, active_rows=None, fixed_cols=None, fixed_values=None):
+        """One-call window narrowing for the rolling-horizon adapter -- set the row
+        mask and the variable-fix state together, all as plain arrays.
+
+        Parameters
+        ----------
+        active_rows : bool array-like, optional
+            Length-``n_row`` mask (``True`` == the row is enforced).  Omit to leave
+            the row mask unchanged.
+        fixed_cols : bool array-like, optional
+            Length-``n_col`` mask (``True`` == the column is fixed).  Omit to leave
+            the fix state unchanged.
+        fixed_values : float array-like, optional
+            Length-``n_col`` pin values, used where ``fixed_cols`` is ``True``.
+            Required when ``fixed_cols`` is given.
+        """
+        if active_rows is not None:
+            self.set_active_rows(active_rows)
+        if fixed_cols is not None:
+            if fixed_values is None:
+                raise ValueError(
+                    "set_window: fixed_values is required with fixed_cols."
+                )
+            self.set_fixed_variables(fixed_cols, fixed_values)
+        return self
+
+    def clear_window(self):
+        """Drop the whole overlay: re-activate every row and release every fixed
+        variable (the next solve restores the full, un-narrowed model)."""
+        self._require_loaded()
+        if not self._overlay_active:
+            return self
+        self._row_active[:] = True
+        self._col_fixed[:] = False
+        return self
+
+    def masked_objective_constant(self):
+        """The constant that fixed variables contribute to the reported objective:
+        ``sum_j c_j * value_j`` over the currently-fixed columns, at the current
+        objective coefficients.
+
+        Convention: :meth:`solve` reports the objective of the *full* model
+        evaluated with the fixed (out-of-window) variables held at their pin values
+        -- the honest objective of what HiGHS solved.  That equals the
+        structurally-narrowed window problem's objective **plus** this constant, so
+        subtract it to recover the pure in-window cost.  Relaxed (masked) rows never
+        enter the objective, so only fixes contribute.  ``0.0`` when nothing is fixed.
+        """
+        self._require_loaded()
+        if not self._overlay_active:
+            return 0.0
+        fixed = self._col_fixed
+        if not fixed.any():
+            return 0.0
+        return float(np.dot(self._cur_cost[fixed], self._col_fix_val[fixed]))
+
+    def _as_index_array(self, idx, n, kind):
+        """Validate and normalize a raw index array to contiguous int32 in
+        ``[0, n)``."""
+        idx = np.ascontiguousarray(idx, dtype=np.int64).ravel()
+        if idx.size and (idx.min() < 0 or idx.max() >= n):
+            raise IndexError(
+                f"{kind} index out of range for a model with {n} {kind}s "
+                f"(got min={int(idx.min())}, max={int(idx.max())})."
+            )
+        return idx
 
     def _require_loaded(self):
         if self._highs is None:
