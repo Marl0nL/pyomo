@@ -50,6 +50,31 @@ Model sizes are named by their target linear-constraint-matrix nonzero count
 size-limited-license cap so the matrix-API comparator can run. The harness
 reports *actual* sizes, so the target names are approximate.
 
+## Reports (per-phase index)
+
+Each phase of the vectorized-construction project published a self-contained
+report next to this file; every speedup claim in the design proposal
+(`docs/vector_proposal.md`) and the user guide (`pyomo/contrib/vector/README.md`)
+is reproduced from one of these. All share the one environment recorded in each
+report's header (Pyomo `6.10.2.dev0`, Python 3.12, numpy 2.5.2 · scipy 1.18.1 ·
+highspy 1.15.1); each `(model, size)` case runs in its own subprocess.
+
+| Report | Topic | Headline |
+|---|---|---|
+| [`PHASE0_REPORT.md`](PHASE0_REPORT.md) | baseline + feasibility spikes | per-row solver **load is 76–95%** of the coherent `build→solver` route; Pyomo is ~20–38× a raw array→HiGHS path; Spike A (columnar `Var`) ~360–540× alloc / ~0.14× memory; Spike B (template) 13–16× extraction, with a mandatory scalarization fallback |
+| [`PHASE2_REPORT.md`](PHASE2_REPORT.md) | `highs_fastload` — transparent classic hand-off | hand-off **3.1–6.4×** faster; end-to-end up to **4.50×** (load-bound), 2.1–2.7× (construct-bound, shared-construct ceiling) |
+| [`PHASE3_REPORT.md`](PHASE3_REPORT.md) | template-vectorized construction | **11.2× construct / 9.8× end-to-end** on a templatizable model; byte-identical classic fallback; no material slowdown off-subset |
+| [`PHASE4_REPORT.md`](PHASE4_REPORT.md) | `highs_faststep` — persistent warm re-solve | warm tick **2.33×** at 1e5 nnz (3.39× at 1e4) vs persistent APPSI HiGHS |
+| [`VALUEGUARD_REPORT.md`](VALUEGUARD_REPORT.md) | value-aware static-matrix guard | accept a nominally-mutable matrix coefficient; per-roll overhead **0.1–0.2%** |
+| [`STATICFOLD_REPORT.md`](STATICFOLD_REPORT.md) | verified-static parameter folding | engage models with non-affine (`price·dur`) params; **5.02× / 3.49×** over APPSI on the same model |
+| [`COMPILE_SCALING_REPORT.md`](COMPILE_SCALING_REPORT.md) | near-linear `set_instance` compile | super-linear → **near-linear** (byte-identical output); 19.6× at 1024 folds |
+| [`QUADRATIC_QP_REPORT.md`](QUADRATIC_QP_REPORT.md) | convex-quadratic objective (#1761) | **37–58× construction**; solve at parity (solver-bound) |
+| [`GUROBI_FASTLOAD_REPORT.md`](GUROBI_FASTLOAD_REPORT.md) | `gurobi_fastload` — Gurobi matrix hand-off | **~3.8–5.4×** hand-off at licensed sizes only (2000-var/-constr cap; no larger claim) |
+
+Raw result JSONs are under `bench/results/`. The design proposal
+(`docs/vector_proposal.md`) synthesizes these into the upstream case and the
+`contrib → core` migration split.
+
 ## Running
 
 The harness runs in a dedicated virtualenv (`bench/.venv`, not committed) holding
