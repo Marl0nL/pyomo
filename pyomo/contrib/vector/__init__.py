@@ -37,6 +37,15 @@ Phase 3 -- template-vectorized construction ("your old code gets fast"):
 * :func:`compile_templated_to_highs_arrays` -- vectorized whole-model compile
   that feeds ``highs_fastload`` with no scalarization.
 
+Phase 4 -- array-native persistent **warm re-solve** (the rolling-horizon path):
+
+* :class:`FastStepHighs` -- a persistent HiGHS interface for MPC / rolling-horizon
+  workloads: compile once + ``passModel``, retain the live solver, and re-solve
+  each roll by pushing the changed objective coefficients / RHS / bounds as
+  vectorized arrays (affine templates ``M @ P``) through HiGHS's batch APIs,
+  keeping the warm basis.  Both a model-driven (mutate Params, ``solve``) and an
+  array / mapping-free (``solve(param_values=...)``) update path.
+
 The Phase-1 components fall back to classic per-index data objects
 (*scalarization*) when touched by a consumer that does not understand them, per
 the compatibility contract (scoping doc §6.5).
@@ -61,6 +70,9 @@ from pyomo.contrib.vector.fastload import (
     compile_to_highs_arrays,
     build_highs_lp,
 )
+
+# Phase 4 -- array-native persistent warm re-solve for the rolling-horizon path.
+from pyomo.contrib.vector.faststep import FastStepHighs
 
 # Phase-3 template-vectorized construction ("your old code gets fast"): the
 # opt-in switch + the vectorized whole-model compile that feeds highs_fastload.
@@ -95,6 +107,7 @@ __all__ = [
     'FastLoadHighs',
     'compile_to_highs_arrays',
     'build_highs_lp',
+    'FastStepHighs',
     'vectorized_construction',
     'templatize_enabled_by_env',
     'apply_env_templatize',
