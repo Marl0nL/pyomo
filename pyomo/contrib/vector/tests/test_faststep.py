@@ -1040,5 +1040,241 @@ class TestFastStepFolding(unittest.TestCase):
         self.assertFalse(s.classification_report()['folding_engaged'])
 
 
+# --------------------------------------------------------------------------- #
+# Compile-scaling refactor: the fold classifier and coefficient signatures were
+# rewritten for near-linear set_instance compile.  These tests lock that the
+# rewrite did not change *what* is compiled -- the coefficient signatures are
+# byte-identical to the reverse-mode-differentiation reference they optimize, and
+# the incremental fold greedy returns the identical fold set to a brute-force
+# replay of the original O(folds x couplings) algorithm.
+# --------------------------------------------------------------------------- #
+class _FakeParam:
+    """Minimal ParamData stand-in for the fold-classifier tests: the classifier
+    only needs object identity and a unique ``.name`` (its tie-break)."""
+
+    def __init__(self, name):
+        self.name = name
+
+
+def _reference_folded(sigs, hub_min=2):
+    """Brute-force replay of the pre-refactor fold greedy (rebuild the full
+    candidate set and rescan every coupling on each fold).  The incremental
+    classifier must return an identical fold set for any coupling structure."""
+    from pyomo.contrib.vector.faststep import _SIG_PARAM, _SIG_RESIDUAL
+
+    couplings = []
+    names = {}
+    for sig in sigs:
+        if sig.kind == _SIG_PARAM:
+            p = sig.all_params[0]
+            couplings.append({id(p): frozenset()})
+            names[id(p)] = p.name
+        elif sig.kind == _SIG_RESIDUAL:
+            couplings.append({})
+        else:
+            cmap = {}
+            for p, _dv, deps in sig.terms:
+                names[id(p)] = p.name
+                cmap[id(p)] = deps
+            couplings.append(cmap)
+    folded = set()
+    for cmap in couplings:
+        for pid, deps in cmap.items():
+            if pid in deps:
+                folded.add(pid)
+    while True:
+        cover = {}
+        any_conflict = False
+        for ei, cmap in enumerate(couplings):
+            for pid, deps in cmap.items():
+                if pid in folded:
+                    continue
+                residual = deps - folded
+                if residual:
+                    any_conflict = True
+                    cover.setdefault(pid, set()).add(ei)
+                    for did in residual:
+                        cover.setdefault(did, set()).add(ei)
+        if not any_conflict:
+            break
+        best = max(cover, key=lambda k: (len(cover[k]), names.get(k, '')))
+        if len(cover[best]) < hub_min:
+            break
+        folded.add(best)
+    return folded
+
+
+def _rand_sigs(rng):
+    """A randomized coupling structure (bare params, residuals, and affine
+    couplings whose partials reference a random subset of the expression's own
+    parameters, with occasional self-coupling)."""
+    from pyomo.contrib.vector.faststep import (
+        _CoefSig,
+        _SIG_PARAM,
+        _SIG_RESIDUAL,
+        _SIG_AFFINE,
+    )
+
+    n = int(rng.integers(3, 16))
+    pool = [_FakeParam("p_%03d" % i) for i in range(n)]
+    ids = [id(p) for p in pool]
+    sigs = []
+    for _ in range(int(rng.integers(4, 30))):
+        r = rng.random()
+        if r < 0.18:
+            sigs.append(_CoefSig(_SIG_PARAM, (pool[int(rng.integers(n))],), None, None))
+        elif r < 0.30:
+            sigs.append(_CoefSig(_SIG_RESIDUAL, (), None, None))
+        else:
+            k = int(rng.integers(1, min(4, n) + 1))
+            sel = [int(i) for i in rng.choice(n, size=k, replace=False)]
+            params = tuple(pool[i] for i in sel)
+            sel_ids = [ids[i] for i in sel]
+            terms = []
+            for p in params:
+                others = [q for q in sel_ids if q != id(p)]
+                deps = {q for q in others if rng.random() < 0.6}
+                if rng.random() < 0.15:
+                    deps.add(id(p))  # self-coupling -> a forced fold
+                terms.append((p, 1.0, frozenset(deps)))
+            sigs.append(_CoefSig(_SIG_AFFINE, params, terms, 0.0))
+    return sigs
+
+
+def _hub_sigs(n_hubs, spokes_per_hub):
+    """``n_hubs`` hubs, each multiplied against ``spokes_per_hub`` distinct spoke
+    parameters (the ``price[t]*dt[z]`` shape).  The fold count scales with the
+    model -- exactly the structure whose per-fold full rescan made the original
+    greedy superlinear."""
+    from pyomo.contrib.vector.faststep import _CoefSig, _SIG_AFFINE
+
+    sigs = []
+    for h in range(n_hubs):
+        hub = _FakeParam("hub_%03d" % h)
+        for s in range(spokes_per_hub):
+            spoke = _FakeParam("spoke_%03d_%03d" % (h, s))
+            terms = [
+                (spoke, 1.0, frozenset((id(hub),))),  # d(spoke*hub)/dspoke == hub
+                (hub, 1.0, frozenset((id(spoke),))),  # d(spoke*hub)/dhub == spoke
+            ]
+            sigs.append(_CoefSig(_SIG_AFFINE, (spoke, hub), terms, 0.0))
+    return sigs
+
+
+def _multihub_model(n_zones=8, per_zone=6):
+    """A rolling model with a per-zone structural-constant duration ``dt[z]``
+    multiplying every ``price[z,t]`` -- ``n_zones`` hub folds."""
+    m = pyo.ConcreteModel()
+    Z = range(n_zones)
+    Tz = range(per_zone)
+    idx = [(z, t) for z in Z for t in Tz]
+    m.x = pyo.Var(idx, domain=pyo.NonNegativeReals, bounds=(0, 10))
+    m.price = pyo.Param(
+        idx, initialize={k: 1.0 + 0.01 * (k[0] + k[1]) for k in idx}, mutable=True
+    )
+    m.dt = pyo.Param(list(Z), initialize={z: 0.25 + 0.05 * z for z in Z}, mutable=True)
+    m.dem = pyo.Param(idx, initialize={k: 0.5 for k in idx}, mutable=True)
+    m.cap = pyo.Constraint(
+        list(Z), rule=lambda mm, z: sum(mm.x[z, t] for t in Tz) <= 100.0
+    )
+    m.bal = pyo.Constraint(idx, rule=lambda mm, z, t: mm.x[z, t] >= mm.dem[z, t])
+    m.obj = pyo.Objective(
+        expr=sum(m.price[z, t] * m.dt[z] * m.x[z, t] for z in Z for t in Tz),
+        sense=pyo.minimize,
+    )
+    return m
+
+
+@unittest.skipUnless(_deps, "highs_faststep requires numpy/scipy/highspy")
+class TestFastStepCompileScaling(unittest.TestCase):
+    """The near-linear-compile refactor preserves exactly what is compiled."""
+
+    def test_product_fastpath_matches_reverse_sd(self):
+        # The structural product fast path must produce byte-identical signature
+        # terms (partial value + dependency set) to the reverse-mode
+        # differentiation it bypasses -- on both fast-path shapes (param*param,
+        # const*param, immutable*param) and shapes that must fall back (p*p,
+        # sum*param, reciprocal).
+        from pyomo.core.expr import identify_mutable_parameters
+        from pyomo.core.expr.calculus.diff_with_pyomo import reverse_sd
+        from pyomo.contrib.vector.faststep import _coef_signature, _SIG_AFFINE
+
+        m = pyo.ConcreteModel()
+        m.a = pyo.Param(initialize=2.0, mutable=True)
+        m.b = pyo.Param(initialize=3.0, mutable=True)
+        m.c = pyo.Param(initialize=5.0, mutable=True)
+        m.k = pyo.Param(initialize=7.0, mutable=False)  # immutable -> a constant
+        exprs = [
+            m.a * m.b,  # param * param      -> fast path
+            2.0 * m.a,  # const * param      -> fast path
+            m.k * m.a,  # immutable * param  -> fast path (k is constant)
+            m.a * m.a,  # p * p              -> fall back (partial is 2a)
+            (m.a + m.b) * m.c,  # sum * param -> fall back
+            m.a / m.b,  # reciprocal         -> fall back
+        ]
+        for e in exprs:
+            sig = _coef_signature(e)
+            self.assertEqual(sig.kind, _SIG_AFFINE)
+            params = tuple(identify_mutable_parameters(e))
+            self.assertEqual(tuple(t[0] for t in sig.terms), params)
+            derivs = reverse_sd(e)
+            for p, dval, deps in sig.terms:
+                d = derivs[p] if p in derivs else 0
+                self.assertEqual(dval, float(pyo.value(d)))
+                ref_deps = frozenset(id(pp) for pp in identify_mutable_parameters(d))
+                self.assertEqual(deps, ref_deps)
+            self.assertEqual(sig.base_value, float(pyo.value(e)))
+
+    def test_incremental_greedy_matches_reference_random(self):
+        # Randomized coupling structures fold identically to the brute-force
+        # replay of the original full-rescan greedy.
+        from pyomo.contrib.vector.faststep import _classify_folded
+
+        rng = np.random.default_rng(2026)
+        for trial in range(300):
+            sigs = _rand_sigs(rng)
+            got, _ = _classify_folded(sigs)
+            self.assertEqual(got, _reference_folded(sigs), "random trial %d" % trial)
+
+    def test_incremental_greedy_matches_reference_manyhub(self):
+        # Many-hub structures (the superlinear stressor) fold identically to the
+        # reference, and every hub with >= 2 spokes folds.
+        from pyomo.contrib.vector.faststep import _classify_folded
+
+        for n_hubs, spokes in [(1, 5), (4, 4), (16, 8), (64, 3), (200, 2)]:
+            sigs = _hub_sigs(n_hubs, spokes)
+            got, _ = _classify_folded(sigs)
+            self.assertEqual(got, _reference_folded(sigs))
+            self.assertEqual(len(got), n_hubs)  # every hub folds, no spoke folds
+
+    def test_manyhub_model_folds_and_solves(self):
+        # End-to-end: a model with many hub folds engages the warm path, folds
+        # exactly the hub durations, and warm-solves to the fresh-build optimum.
+        from pyomo.contrib.vector.faststep import FastStepHighs
+
+        n_zones, per_zone = 8, 6
+        m = _multihub_model(n_zones, per_zone)
+        s = FastStepHighs()
+        s.set_instance(m)
+        folded = s.folded_parameters
+        self.assertEqual(len(folded), n_zones)
+        self.assertTrue(all(name.startswith("dt") for name in folded))
+
+        res = s.solve()
+        self.assertEqual(
+            res.termination_condition, self.TC.convergenceCriteriaSatisfied
+        )
+        ref = _fastload().solve(m, raise_exception_on_nonoptimal_result=False)
+        scale = max(1.0, abs(ref.incumbent_objective or 0.0))
+        self.assertLess(
+            abs(res.incumbent_objective - ref.incumbent_objective) / scale, 1e-6
+        )
+
+    def setUp(self):
+        from pyomo.contrib.solver.common.results import TerminationCondition
+
+        self.TC = TerminationCondition
+
+
 if __name__ == "__main__":
     unittest.main()

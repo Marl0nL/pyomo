@@ -172,6 +172,7 @@ Scope (fail loud, never a stale-matrix solve)
 from __future__ import annotations
 
 import datetime
+import heapq
 import io
 import logging
 import time
@@ -185,7 +186,8 @@ from pyomo.core.base.constraint import Constraint
 from pyomo.core.base.objective import Objective
 from pyomo.core.base.var import Var
 from pyomo.core.expr import identify_mutable_parameters, identify_variables
-from pyomo.core.expr.calculus.derivatives import differentiate
+from pyomo.core.expr.calculus.diff_with_pyomo import reverse_sd
+from pyomo.core.expr.numeric_expr import ProductExpression, NPV_ProductExpression
 from pyomo.core.expr.numvalue import is_constant, value
 from pyomo.repn.standard_repn import generate_standard_repn
 
@@ -219,21 +221,175 @@ _inf = float('inf')
 _SELFCHECK_ATOL = 1e-8
 _SELFCHECK_RTOL = 1e-7
 
-# The symbolic derivative mode: ``reverse_symbolic`` returns the derivative as an
-# *expression* (``d(price*dur)/dprice == dur``), so a partial that still
-# references another varying parameter is detectable as non-constant.  (The
-# default ``reverse_numeric`` bakes in the current values of the other params, so
-# a genuinely non-affine product yields a numerically-constant -- and therefore
-# *wrong* -- partial.)  Used for both the fold classification and the affine
-# decomposition below.
-_REVSYM = 'reverse_symbolic'
+# The signatures below differentiate with reverse-mode *symbolic* differentiation
+# (:func:`reverse_sd`, the engine behind ``differentiate(..., mode='reverse_
+# symbolic')``).  It returns each partial as an *expression* (``d(price*dur)/dprice
+# == dur``), so a partial that still references another varying parameter is
+# detectable as non-constant.  The numeric mode (``reverse_ad``) instead bakes in
+# the current values of the other params, so a genuinely non-affine product would
+# yield a numerically-constant -- and therefore *wrong* -- partial.
 
-# Sentinel returned by :func:`_affine_over_varying` for an entry that is
-# genuinely non-affine in a *varying* parameter (a product/reciprocal of two
-# varying params) -- distinct from ``None`` (a fixed-variable residual, evaluated
-# per-solve).  A ``_NONAFFINE`` entry that survives fold classification is
-# rejected loudly at ``set_instance`` (it can never be templated correctly).
+# Sentinel returned by :func:`_affine_from_sig` for an entry that is genuinely
+# non-affine in a *varying* parameter (a product/reciprocal of two varying params)
+# -- distinct from ``None`` (a fixed-variable residual, evaluated per-solve).  A
+# ``_NONAFFINE`` entry that survives fold classification is rejected loudly at
+# ``set_instance`` (it can never be templated correctly).
 _NONAFFINE = object()
+
+
+# --------------------------------------------------------------------------- #
+# Per-coefficient signature: the expensive symbolic walk, computed ONCE
+# --------------------------------------------------------------------------- #
+# Building the affine templates and classifying the fold set both need, for each
+# mutable coefficient expression, the same facts: whether it is a bare parameter,
+# a fixed-variable residual, or affine-in-parameters -- and, if affine, each
+# parameter's symbolic partial (its value, and which parameters that partial still
+# references).  The pre-refactor code walked every expression *twice* -- once in
+# :func:`_classify_folded` to build the couplings, once in ``_affine_over_varying``
+# to build the templates (plus a third ``identify_mutable_parameters`` walk to
+# register the parameter vector) -- which made the per-coefficient ``differentiate``
+# the dominant compile cost.  A :class:`_CoefSig` captures the walk once; fold
+# classification, parameter registration, and template construction all read it.
+_SIG_PARAM = 0  # a bare mutable parameter (price[t]) -- the dominant case
+_SIG_RESIDUAL = 1  # references a (fixed) variable -- evaluated per-solve
+_SIG_AFFINE = 2  # a linear-combination-of-parameters coefficient
+
+
+class _CoefSig:
+    """The once-computed symbolic signature of a mutable coefficient expression.
+
+    ``all_params`` is the expression's mutable parameters in
+    ``identify_mutable_parameters`` order (so the parameter vector registers in a
+    stable order).  For an affine signature ``terms`` holds the per-parameter
+    ``(param, d_value, dep_ids)`` triple -- ``d_value`` is the symbolic partial
+    ``d(e)/d(param)`` evaluated at ``set_instance``, ``dep_ids`` the ids of the
+    parameters that partial still references (empty ==> a constant partial ==>
+    affine in that parameter) -- and ``base_value`` is ``value(e)`` at
+    ``set_instance``.
+    """
+
+    __slots__ = ('kind', 'all_params', 'terms', 'base_value')
+
+    def __init__(self, kind, all_params, terms, base_value):
+        self.kind = kind
+        self.all_params = all_params
+        self.terms = terms
+        self.base_value = base_value
+
+
+def _coef_signature(e):
+    """Compute the :class:`_CoefSig` for one mutable coefficient expression.
+
+    Mirrors the branch order the pre-refactor ``_affine_over_varying`` /
+    :func:`_classify_folded` used (bare parameter, then fixed-variable residual,
+    then the affine per-parameter ``differentiate`` walk), so the templates and
+    fold classification derived from it are byte-for-byte what those two
+    independent walks produced.
+    """
+    if getattr(e, 'is_parameter_type', _false)():
+        return _CoefSig(_SIG_PARAM, (e,), None, None)
+    for _v in identify_variables(e, include_fixed=True):
+        # A (fixed) variable makes the entry a residual (evaluated per-solve); it
+        # still registers its parameters so their vector position stays stable.
+        return _CoefSig(
+            _SIG_RESIDUAL, tuple(identify_mutable_parameters(e)), None, None
+        )
+    params = tuple(identify_mutable_parameters(e))
+    terms = []
+    # Only differentiate when a mutable parameter is actually present: the
+    # pre-refactor code called ``differentiate`` *inside* the per-parameter loop,
+    # so a non-constant coefficient with no mutable parameter (e.g. an
+    # ``NPV_Max``/``NPV_Min`` bound over constants, which reverse-mode cannot
+    # differentiate) was never differentiated -- it is simply a constant shift.
+    if params:
+        # Structural fast path for the dominant coefficient shape -- a product of
+        # two distinct bare parameters (``price*dt``) or a constant times one bare
+        # parameter -- whose partial wrt each parameter factor is simply the other
+        # factor (exactly the node reverse-mode differentiation returns).  Any
+        # other structure (a sum, reciprocal, power, or shared factor) returns
+        # ``None`` and falls back to the reverse-mode walk below.
+        terms = _product_terms(e, params)
+        if terms is None:
+            # Reverse-mode symbolic differentiation computes the partial wrt
+            # *every* node in one backward walk, so ``reverse_sd(e)`` once and
+            # indexing per parameter replaces the pre-refactor
+            # ``differentiate(e, wrt=p)`` per parameter -- which re-ran the whole
+            # reverse-mode walk for each parameter.  The indexed result is
+            # identical to ``differentiate(e, wrt=p, mode='reverse_symbolic')``
+            # (which is exactly ``reverse_sd(e)[p]``, or ``0`` when ``p`` absent).
+            derivs = reverse_sd(e)
+            terms = []
+            for p in params:
+                d = derivs[p] if p in derivs else 0
+                deps = _deriv_deps(d)
+                terms.append((p, float(value(d)), deps))
+    return _CoefSig(_SIG_AFFINE, params, terms, float(value(e)))
+
+
+def _deriv_deps(d):
+    """The mutable parameters a symbolic partial ``d`` still references, as an
+    id frozenset.  A bare-parameter partial (the dominant ``d(price*dur)/dprice ==
+    dur`` case) is its own single dependency when mutable, or none when an
+    immutable parameter -- exactly what ``identify_mutable_parameters`` returns,
+    without the walk."""
+    if getattr(d, 'is_parameter_type', _false)():
+        return frozenset() if is_constant(d) else frozenset((id(d),))
+    return frozenset(id(pp) for pp in identify_mutable_parameters(d))
+
+
+def _product_terms(e, params):
+    """Structural affine terms for a two-factor product of bare parameters and
+    constants, or ``None`` when ``e`` is not that shape (fall back to reverse_sd).
+
+    For ``e = f0 * f1`` with each factor a bare parameter or a constant (and, when
+    both factors are parameters, two *distinct* parameters), the partial wrt a
+    parameter factor is exactly the other factor -- the same node reverse-mode
+    differentiation returns -- so the affine term ``(param, value(other),
+    deps(other))`` is read straight off the product, byte-for-byte what the
+    reverse-mode path would produce, without a differentiation walk.
+    """
+    if (
+        e.__class__ is not ProductExpression
+        and e.__class__ is not NPV_ProductExpression
+    ):
+        return None
+    args = e.args
+    if len(args) != 2:
+        return None
+    a, b = args
+    a_param = getattr(a, 'is_parameter_type', _false)()
+    b_param = getattr(b, 'is_parameter_type', _false)()
+    a_ok = a_param or a.__class__ is int or a.__class__ is float or is_constant(a)
+    b_ok = b_param or b.__class__ is int or b.__class__ is float or is_constant(b)
+    if not (a_ok and b_ok):
+        return None
+    if a_param and b_param and a is b:
+        return None  # p*p -> the partial is 2p, not the "other" factor
+    terms = []
+    for p in params:
+        if p is a:
+            other = b
+        elif p is b:
+            other = a
+        else:
+            return None  # a mutable parameter that is not itself a factor
+        terms.append((p, float(value(other)), _deriv_deps(other)))
+    return terms
+
+
+class _MaxName:
+    """A string wrapper that orders in reverse, so popping a min-heap reproduces
+    ``max(candidates, key=name)`` on a coverage tie (see :func:`_classify_folded`).
+    Parameter names are unique, so this never has to fall through to a further
+    tie-break."""
+
+    __slots__ = ('s',)
+
+    def __init__(self, s):
+        self.s = s
+
+    def __lt__(self, other):
+        return self.s > other.s
 
 
 # --------------------------------------------------------------------------- #
@@ -297,8 +453,8 @@ class _AffineArray:
         return bool(self.residual)
 
 
-def _affine_over_varying(e, param_index, folded_ids):
-    """Decompose ``e`` affinely over the **varying** parameter vector.
+def _affine_from_sig(sig, param_index, folded_ids):
+    """Decompose a coefficient's :class:`_CoefSig` affinely over the varying params.
 
     ``folded_ids`` is the set of ``id(ParamData)`` that have been *folded* --
     treated as watched constants at their current values (see
@@ -307,42 +463,43 @@ def _affine_over_varying(e, param_index, folded_ids):
     ``price * duration`` with ``duration`` folded decomposes to the affine
     ``duration_value * price`` over the remaining varying parameter ``price``.
 
-    Returns:
+    Same contract as the pre-refactor ``_affine_over_varying`` (which walked the
+    expression directly, re-doing the ``differentiate`` the signature already
+    holds):
 
-    * ``(shift, {param_pos: coef})`` when ``e`` is affine in the varying
+    * ``(shift, {param_pos: coef})`` when the coefficient is affine in the varying
       parameters (folded parameters treated as constants);
-    * ``None`` when ``e`` references a (fixed) variable -- a *residual*, evaluated
+    * ``None`` when it references a (fixed) variable -- a *residual*, evaluated
       per-solve with ``value()`` (correctness preserved, that entry not
       vectorized);
-    * :data:`_NONAFFINE` when ``e`` is genuinely non-affine in a *varying*
-      parameter (a product/reciprocal of two varying params that folding did not
-      resolve) -- the caller rejects the model loudly.
+    * :data:`_NONAFFINE` when it is genuinely non-affine in a *varying* parameter
+      (a product/reciprocal of two varying params that folding did not resolve) --
+      the caller rejects the model loudly.
     """
     # Fast path: a bare mutable parameter (``price[t]``) -- the dominant case.
-    if getattr(e, 'is_parameter_type', _false)():
-        if id(e) in folded_ids:
-            return float(value(e)), {}  # a bare folded param is a constant
-        return 0.0, {param_index[id(e)]: 1.0}
+    if sig.kind == _SIG_PARAM:
+        p = sig.all_params[0]
+        if id(p) in folded_ids:
+            return float(value(p)), {}  # a bare folded param is a constant
+        return 0.0, {param_index[id(p)]: 1.0}
     # A (fixed) variable in the expression makes the constant term depend on a
     # value that is not in the parameter vector -> evaluate as a residual.
-    for _v in identify_variables(e, include_fixed=True):
+    if sig.kind == _SIG_RESIDUAL:
         return None
     coefs = {}
-    shift = float(value(e))
-    for p in identify_mutable_parameters(e):
+    shift = sig.base_value
+    for p, dval, deps in sig.terms:
         pid = id(p)
         if pid in folded_ids:
             continue  # folded -> constant; its value is already folded into shift
-        d = differentiate(e, wrt=p, mode=_REVSYM)
         # ``e`` is affine in the varying param ``p`` iff its symbolic derivative
         # references *no varying parameter* (it may reference folded ones -- those
         # are constants).  A varying reference means a genuine coupling.
-        for pp in identify_mutable_parameters(d):
-            if id(pp) not in folded_ids:
+        for dep in deps:
+            if dep not in folded_ids:
                 return _NONAFFINE
-        c = float(value(d))
-        coefs[param_index[pid]] = c
-        shift -= c * float(value(p))
+        coefs[param_index[pid]] = dval
+        shift -= dval * float(value(p))
     return shift, coefs
 
 
@@ -350,15 +507,19 @@ def _false():
     return False
 
 
-def _build_affine_array(slots, param_index, n_params, open_sign, folded_ids, what):
+def _build_affine_array(
+    slots, sig_by_id, param_index, n_params, open_sign, folded_ids, what
+):
     """Build an :class:`_AffineArray` from a list of bound/coefficient ``slots``.
 
     Each slot is ``None`` (an open bound side -> ``open_sign * inf`` in ``base``),
     a plain ``float`` (a fixed value kept in ``base``), or a Pyomo expression
     (templated when affine in the varying parameters, folded parameters treated
     as constants; a fixed-variable entry recorded as a residual and evaluated
-    with ``value()`` every solve).  ``what`` names the group for a fail-loud
-    message if an entry is genuinely non-affine in a varying parameter.
+    with ``value()`` every solve).  ``sig_by_id`` maps ``id(expr) -> _CoefSig``
+    (the once-computed symbolic signature reused across every group).  ``what``
+    names the group for a fail-loud message if an entry is genuinely non-affine in
+    a varying parameter.
     """
     n = len(slots)
     rows = []
@@ -372,7 +533,7 @@ def _build_affine_array(slots, param_index, n_params, open_sign, folded_ids, wha
         elif s.__class__ is float or s.__class__ is int:
             base[i] = float(s)
         else:
-            aff = _affine_over_varying(s, param_index, folded_ids)
+            aff = _affine_from_sig(sig_by_id[id(s)], param_index, folded_ids)
             if aff is None:
                 residual.append((i, s))
             elif aff is _NONAFFINE:
@@ -399,12 +560,13 @@ def _build_affine_array(slots, param_index, n_params, open_sign, folded_ids, wha
     return _AffineArray(M, base, residual)
 
 
-def _classify_folded(coef_exprs, hub_min=2):
+def _classify_folded(sigs, hub_min=2):
     """Decide which mutable parameters to **fold** (treat as watched constants).
 
-    ``coef_exprs`` is the list of mutable coefficient / bound expressions across
-    every template group (objective coefficients and offset, row bounds/RHS,
-    variable bounds, matrix coefficients).  A parameter is *folded* -- its current
+    ``sigs`` is the list of :class:`_CoefSig` signatures for the mutable
+    coefficient / bound expressions across every template group (objective
+    coefficients and offset, row bounds/RHS, variable bounds, matrix
+    coefficients).  A parameter is *folded* -- its current
     value substituted as a constant during template construction -- when it
     participates **non-affinely** and folding it is what makes the remaining
     (varying) parameters affine.  Two reasons force a fold:
@@ -421,27 +583,41 @@ def _classify_folded(coef_exprs, hub_min=2):
       rejected downstream: with no evidence which factor is static, folding one
       would be a coin-flip that the value guard would trip every roll.
 
-    Returns ``(folded_ids: set, names: dict[id -> Param.name])``.  The fold set
+    Returns ``(folded_ids: set, names: dict[id -> Param.name])``, ``names`` holding
+    only the fold candidates that were actually named (see below).  The fold set
     is a *best effort* to make the templates affine; the ``set_instance``
     self-check remains the hard correctness gate, and every folded parameter is
     watched by the value guard (a genuine change fails loud or, opt-in, reloads).
     """
     couplings = []  # per-expr {param_id: frozenset(dep param ids in d/dp)}
-    names = {}
-    for e in coef_exprs:
-        if getattr(e, 'is_parameter_type', _false)():
-            couplings.append({id(e): frozenset()})
-            names[id(e)] = e.name
-            continue
-        if any(True for _ in identify_variables(e, include_fixed=True)):
+    pd_by_id = {}  # param_id -> ParamData (for lazy name lookup on fold candidates)
+    for sig in sigs:
+        if sig.kind == _SIG_PARAM:
+            p = sig.all_params[0]
+            couplings.append({id(p): frozenset()})
+            pd_by_id[id(p)] = p
+        elif sig.kind == _SIG_RESIDUAL:
             couplings.append({})  # fixed-variable residual: no param templating
-            continue
-        cmap = {}
-        for p in identify_mutable_parameters(e):
-            names[id(p)] = p.name
-            d = differentiate(e, wrt=p, mode=_REVSYM)
-            cmap[id(p)] = frozenset(id(pp) for pp in identify_mutable_parameters(d))
-        couplings.append(cmap)
+        else:
+            cmap = {}
+            for p, _dval, deps in sig.terms:
+                pd_by_id[id(p)] = p
+                cmap[id(p)] = deps
+            couplings.append(cmap)
+
+    # ``getname`` on an indexed component is costly, and the greedy tie-break only
+    # ever needs the name of the fold *candidates* (the parameters that reach the
+    # heap) -- a small fraction of the parameters on a large model.  Resolve names
+    # lazily, memoized, instead of naming every parameter up front.
+    names = {}
+
+    def _name(pid):
+        nm = names.get(pid)
+        if nm is None:
+            pd = pd_by_id.get(pid)
+            nm = pd.name if pd is not None else ''
+            names[pid] = nm
+        return nm
 
     # Forced folds: a parameter non-affine in itself (reciprocal / power).
     folded = set()
@@ -450,28 +626,59 @@ def _classify_folded(coef_exprs, hub_min=2):
             if pid in deps:
                 folded.add(pid)
 
-    # Greedy hub folding for the remaining product couplings.
-    while True:
-        cover = {}  # candidate param id -> set of conflict-expr indices it resolves
-        any_conflict = False
-        for ei, cmap in enumerate(couplings):
-            for pid, deps in cmap.items():
-                if pid in folded:
-                    continue
-                residual = deps - folded
-                if residual:
-                    any_conflict = True
-                    cover.setdefault(pid, set()).add(ei)
-                    for did in residual:
-                        cover.setdefault(did, set()).add(ei)
-        if not any_conflict:
-            break
-        # Fold the hub: the candidate resolving the most distinct couplings
-        # (deterministic tie-break by name).
-        best = max(cover, key=lambda k: (len(cover[k]), names.get(k, '')))
-        if len(cover[best]) < hub_min:
+    # Greedy hub folding for the remaining product couplings, maintained
+    # *incrementally*.  The obvious implementation rebuilds the full candidate set
+    # and rescans every coupling on each fold -- O(folds x couplings), which turns
+    # quadratic on a model whose number of hub folds grows with its size (a
+    # per-asset / per-zone structural constant).  Instead we track, per coupling,
+    # the parameters currently *involved* in its unresolved conflict; folding a
+    # parameter re-examines only the couplings it actually touched, and a lazy
+    # max-heap keyed by ``(coverage, name)`` reproduces the exact same greedy
+    # selection (coverage only ever shrinks as folds accumulate, and parameter
+    # names are unique, so the argmax is identical to a full rescan).
+    def _involved(cmap):
+        inv = set()
+        for pid, deps in cmap.items():
+            if pid in folded:
+                continue
+            residual = deps - folded
+            if residual:
+                inv.add(pid)
+                inv.update(residual)
+        return inv
+
+    cover = {}  # candidate param id -> set of conflict-expr indices it appears in
+    involved = [None] * len(couplings)  # ei -> set of param ids (None if resolved)
+    for ei, cmap in enumerate(couplings):
+        if not cmap:
+            continue
+        inv = _involved(cmap)
+        if inv:
+            involved[ei] = inv
+            for pid in inv:
+                cover.setdefault(pid, set()).add(ei)
+
+    heap = [(-len(s), _MaxName(_name(pid)), pid) for pid, s in cover.items()]
+    heapq.heapify(heap)
+    while heap:
+        neg, _nm, pid = heapq.heappop(heap)
+        s = cover.get(pid)
+        if not s or pid in folded or -neg != len(s):
+            continue  # empty, already folded, or a stale (superseded) coverage
+        if len(s) < hub_min:
             break  # no hub -- leave the residual couplings to be rejected
-        folded.add(best)
+        folded.add(pid)
+        dirty = set()
+        for ei in list(s):
+            old = involved[ei]
+            new = _involved(couplings[ei])
+            involved[ei] = new or None
+            for q in old - new:
+                cover[q].discard(ei)
+                dirty.add(q)
+        for q in dirty:
+            if q not in folded:
+                heapq.heappush(heap, (-len(cover[q]), _MaxName(_name(q)), q))
     return folded, names
 
 
@@ -509,8 +716,11 @@ class _MatrixGuard:
     reuse exactly this (which Params feed which ``A``-entries, with what affine
     relation) to *apply* a genuine change; this guard only **detects** change.
 
-    ``provenance`` carries one ``(constraint_name, variable_name, coef_expr)``
-    per entry so a fail-loud message can name the offending coefficient(s).
+    ``provenance`` carries one ``(constraint, variable, coef_expr)`` per entry so
+    a fail-loud message can name the offending coefficient(s).  The component
+    ``.name`` is resolved lazily in :meth:`describe` (the fail-loud path only), not
+    eagerly per entry at ``set_instance`` -- ``getname`` on indexed components is
+    costly, and naming every guarded coefficient up front dominated the compile.
     """
 
     __slots__ = ('rows', 'cols', 'affine', 'baseline', 'provenance')
@@ -520,7 +730,7 @@ class _MatrixGuard:
         self.cols = cols  # int32[N]: A col index per guarded entry
         self.affine = affine  # _AffineArray[N]: coefficient values from P
         self.baseline = baseline  # float64[N]: the values HiGHS was loaded with
-        self.provenance = provenance  # list[(con_name, var_name, coef_expr)]
+        self.provenance = provenance  # list[(con, var, coef_expr)]
 
     @property
     def is_empty(self):
@@ -547,7 +757,8 @@ class _MatrixGuard:
         idx = np.nonzero(changed)[0]
         lines = []
         for k in idx[:limit]:
-            con_name, var_name, coef = self.provenance[int(k)]
+            con, var, coef = self.provenance[int(k)]
+            con_name, var_name = con.name, var.name
             params = sorted({p.name for p in identify_mutable_parameters(coef)})
             pnote = f" [Param(s): {', '.join(params)}]" if params else ""
             lines.append(
@@ -698,7 +909,9 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
                         mat_rows.append(ri)
                         mat_cols.append(j)
                         mat_slots.append(coef)
-                        mat_prov.append((con.name, v.name, coef))
+                        # Store the components, not their names: ``.name`` is
+                        # resolved lazily in _MatrixGuard.describe (fail-loud only).
+                        mat_prov.append((con, v, coef))
             body_cache[cid] = repn
         offset = repn.constant
 
@@ -762,7 +975,16 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
         for s in all_slots
         if s is not None and s.__class__ is not float and s.__class__ is not int
     ]
-    folded_ids, _fold_names = _classify_folded(coef_exprs)
+    # The expensive per-coefficient symbolic walk (``differentiate`` +
+    # ``identify_mutable_parameters``), computed exactly once per distinct
+    # expression and reused by classification, registration, and template
+    # construction (the pre-refactor code walked each expression three times).
+    sig_by_id = {}
+    for s in coef_exprs:
+        sid = id(s)
+        if sid not in sig_by_id:
+            sig_by_id[sid] = _coef_signature(s)
+    folded_ids, _fold_names = _classify_folded([sig_by_id[id(s)] for s in coef_exprs])
 
     # --- parameter registry (ordered P, varying params only) ---------------- #
     params = []
@@ -774,7 +996,7 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
         for s in slots:
             if s is None or s.__class__ is float or s.__class__ is int:
                 continue
-            for p in identify_mutable_parameters(s):
+            for p in sig_by_id[id(s)].all_params:
                 pid = id(p)
                 if pid in folded_ids:
                     if pid not in folded_seen:
@@ -805,33 +1027,70 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
     )
     plan.obj_cols = np.fromiter(obj_cols, dtype=np.int32, count=len(obj_cols))
     plan.obj_affine = _build_affine_array(
-        obj_slots, param_index, n_params, +1, folded_ids, 'objective coefficient'
+        obj_slots,
+        sig_by_id,
+        param_index,
+        n_params,
+        +1,
+        folded_ids,
+        'objective coefficient',
     )
     plan.obj_offset_affine = (
         None
         if obj_offset_slot is None
         else _build_affine_array(
-            [obj_offset_slot], param_index, n_params, +1, folded_ids, 'objective offset'
+            [obj_offset_slot],
+            sig_by_id,
+            param_index,
+            n_params,
+            +1,
+            folded_ids,
+            'objective offset',
         )
     )
     plan.row_idx = np.fromiter(row_idx, dtype=np.int32, count=len(row_idx))
     plan.row_lower_affine = _build_affine_array(
-        row_lower_slots, param_index, n_params, -1, folded_ids, 'row lower bound'
+        row_lower_slots,
+        sig_by_id,
+        param_index,
+        n_params,
+        -1,
+        folded_ids,
+        'row lower bound',
     )
     plan.row_upper_affine = _build_affine_array(
-        row_upper_slots, param_index, n_params, +1, folded_ids, 'row upper bound'
+        row_upper_slots,
+        sig_by_id,
+        param_index,
+        n_params,
+        +1,
+        folded_ids,
+        'row upper bound',
     )
     plan.col_idx = np.fromiter(col_idx, dtype=np.int32, count=len(col_idx))
     plan.col_lower_affine = _build_affine_array(
-        col_lower_slots, param_index, n_params, -1, folded_ids, 'variable lower bound'
+        col_lower_slots,
+        sig_by_id,
+        param_index,
+        n_params,
+        -1,
+        folded_ids,
+        'variable lower bound',
     )
     plan.col_upper_affine = _build_affine_array(
-        col_upper_slots, param_index, n_params, +1, folded_ids, 'variable upper bound'
+        col_upper_slots,
+        sig_by_id,
+        param_index,
+        n_params,
+        +1,
+        folded_ids,
+        'variable upper bound',
     )
 
     # --- matrix-coefficient template (the value guard) ---------------------- #
     matrix_affine = _build_affine_array(
         mat_slots,
+        sig_by_id,
         param_index,
         n_params,
         +1,
