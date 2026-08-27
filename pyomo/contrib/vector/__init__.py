@@ -9,8 +9,10 @@
 
 """``pyomo.contrib.vector`` -- vectorized (columnar) model construction fast path.
 
-Phase-1 vertical slice of the "Vectorized Model Construction for Pyomo" project
-(scoping doc + Phase-0 baseline report).  Provides:
+The "Vectorized Model Construction for Pyomo" project (scoping doc + Phase-0
+baseline report).  Provides:
+
+Phase 1 -- explicit columnar components:
 
 * :class:`VectorVar` -- columnar, array-backed indexed variable
   (materialize-on-touch).
@@ -21,7 +23,21 @@ Phase-1 vertical slice of the "Vectorized Model Construction for Pyomo" project
   form comparable to :class:`~pyomo.repn.plugins.standard_form.LinearStandardFormCompiler`.
 * :func:`load_highs` -- direct ``Highs.passModel`` array hand-off (the load prize).
 
-All three components fall back to classic per-index data objects
+Phase 2 -- transparent fast solver hand-off for unmodified classic models:
+
+* :class:`FastLoadHighs` (``SolverFactory('highs_fastload')``) -- standard-form
+  compile + ``passModel`` bulk load for a classic linear model.
+
+Phase 3 -- template-vectorized construction ("your old code gets fast"):
+
+* :func:`vectorized_construction` -- opt-in context manager (or the
+  ``PYOMO_VECTOR_CONSTRUCT`` env var) that makes a classic
+  ``Constraint(index, rule=...)`` construct array-shaped when its rule
+  templatizes, and fall back to classic construction when it does not.
+* :func:`compile_templated_to_highs_arrays` -- vectorized whole-model compile
+  that feeds ``highs_fastload`` with no scalarization.
+
+The Phase-1 components fall back to classic per-index data objects
 (*scalarization*) when touched by a consumer that does not understand them, per
 the compatibility contract (scoping doc §6.5).
 """
@@ -46,6 +62,22 @@ from pyomo.contrib.vector.fastload import (
     build_highs_lp,
 )
 
+# Phase-3 template-vectorized construction ("your old code gets fast"): the
+# opt-in switch + the vectorized whole-model compile that feeds highs_fastload.
+from pyomo.contrib.vector.template_vectorize import (
+    vectorized_construction,
+    templatize_enabled_by_env,
+    apply_env_templatize,
+    model_has_templates,
+    compile_templated_to_highs_arrays,
+    extract_family,
+    NotVectorizable,
+)
+
+# Honour PYOMO_VECTOR_CONSTRUCT=1 at import so setting the environment variable
+# is sufficient to turn the fast path on process-wide (no code change).
+apply_env_templatize()
+
 __all__ = [
     'VectorVar',
     'VectorVarData',
@@ -63,4 +95,11 @@ __all__ = [
     'FastLoadHighs',
     'compile_to_highs_arrays',
     'build_highs_lp',
+    'vectorized_construction',
+    'templatize_enabled_by_env',
+    'apply_env_templatize',
+    'model_has_templates',
+    'compile_templated_to_highs_arrays',
+    'extract_family',
+    'NotVectorizable',
 ]

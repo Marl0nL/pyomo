@@ -55,6 +55,7 @@ def _pyomo_models() -> Dict[str, Any]:
         unit_commitment,
         facility_location,
         supply_chain,
+        resource_coupling,
     )
 
     reg = {
@@ -62,6 +63,7 @@ def _pyomo_models() -> Dict[str, Any]:
         "unit_commitment": unit_commitment,
         "facility_location": facility_location,
         "supply_chain": supply_chain,
+        "resource_coupling": resource_coupling,
     }
     return reg
 
@@ -76,6 +78,7 @@ PYOMO_MODEL_NAMES = [
     "facility_location",
     "facility_location_q",
     "supply_chain",
+    "resource_coupling",
 ]
 
 COMPARATOR_MODEL_NAMES = ["network_flow", "facility_location"]
@@ -83,8 +86,20 @@ COMPARATOR_MODEL_NAMES = ["network_flow", "facility_location"]
 # Models with a pyomo.contrib.vector fast-path implementation (Phase 1).
 VECTOR_MODEL_NAMES = ["network_flow"]
 
+# Models measured on the Phase-3 template-vectorized construction leg: all the
+# classic pyomo models (templatizable-heavy AND non-templatizable), so both the
+# fast-path win and the no-slowdown-on-fallback guarantee are on the record.
+TEMPLATE_MODEL_NAMES = [
+    "resource_coupling",
+    "facility_location",
+    "network_flow",
+    "unit_commitment",
+    "supply_chain",
+]
+
 ALL_BACKENDS = [
     "pyomo",
+    "pyomo_template",
     "pyomo_vector",
     "linopy",
     "arraynative_highs",
@@ -277,6 +292,182 @@ def _validate_fastload(m, is_quad: bool) -> Dict[str, Any]:
         mf = m.clone()
         r = SolverFactory('highs_fastload').solve(
             mf, raise_exception_on_nonoptimal_result=False
+        )
+        out["fastload_termination"] = str(r.termination_condition)
+        out["fastload_objective"] = (
+            None if r.incumbent_objective is None else float(r.incumbent_objective)
+        )
+        oc = out.get("objective")
+        if oc is not None and out["fastload_objective"] is not None:
+            out["objective_match"] = bool(
+                abs(out["fastload_objective"] - oc) <= 1e-5 * max(1.0, abs(oc))
+            )
+        out["termination_match"] = bool(
+            r.termination_condition == TerminationCondition.convergenceCriteriaSatisfied
+        )
+    except Exception as e:
+        out["fastload_error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def run_pyomo_template_case(
+    model: str,
+    size: str,
+    params: Dict[str, Any],
+    repeats: int,
+    warmup: int,
+    validate: bool,
+) -> Dict[str, Any]:
+    """Phase-3 switch-ON leg: template-vectorized construction.
+
+    Measures the same model built with template-vectorized construction ON and
+    OFF, and the coherent build->solver route both ways, so the Phase-3 exit
+    numbers fall straight out of one case:
+
+    * ``construct_speedup``      -- construct(OFF) / construct(ON)      [crit (a)]
+    * ``end_to_end_vs_classic``  -- (construct+APPSI load) / (construct_ON +
+                                    vectorized fastload)                [crit (b)]
+    * ``end_to_end_vs_phase2``   -- (construct+stock fastload) / phase3  (the
+                                    incremental Phase-3 win over Phase-2)
+    * template coverage          -- how many rows templatized vs fell back
+                                                                        [crit (d)]
+
+    A model whose rules do not templatize (index conditionals / filtered sums)
+    stays on the classic fallback: ``has_templates`` is False and the ON/OFF
+    numbers should match (no material slowdown).
+    """
+    from bench.harness import stages
+    from pyomo.contrib.vector.template_vectorize import (
+        vectorized_construction,
+        model_has_templates,
+    )
+    from pyomo.core.base.constraint import (
+        Constraint,
+        TemplateConstraintData,
+        TemplateScalarConstraint,
+    )
+
+    mod, is_quad = _resolve_pyomo(model)
+    build_params = dict(params)
+    if is_quad:
+        build_params["quadratic"] = True
+
+    result: Dict[str, Any] = {"stages": {}}
+
+    # --- switch OFF (classic construct + classic load + stock fastload) ------ #
+    con_off, m_off = timing.time_construct(
+        "construct_off",
+        lambda: mod.build_pyomo(build_params),
+        repeats=repeats,
+        warmup=warmup,
+    )
+    load_off = timing.time_callable(
+        "load_highs",
+        lambda: stages.stage_load_highs(m_off),
+        repeats=max(3, repeats // 2),
+        warmup=warmup,
+    )
+    fast_off = timing.time_callable(
+        "fastload_off",
+        lambda: stages.stage_fastload_highs(m_off),
+        repeats=max(3, repeats // 2),
+        warmup=warmup,
+    )
+
+    # --- switch ON (template-vectorized construct + vectorized fastload) ----- #
+    def _build_on():
+        with vectorized_construction():
+            return mod.build_pyomo(build_params)
+
+    con_on, m_on = timing.time_construct(
+        "construct_on", _build_on, repeats=repeats, warmup=warmup
+    )
+    fast_on = timing.time_callable(
+        "fastload_on",
+        lambda: stages.stage_fastload_highs(m_on),
+        repeats=max(3, repeats // 2),
+        warmup=warmup,
+    )
+
+    # --- template coverage --------------------------------------------------- #
+    n_t = n_c = 0
+    for con in m_on.component_objects(Constraint, active=True):
+        try:
+            first = next(iter(con.values()))
+        except StopIteration:
+            continue
+        if isinstance(first, (TemplateConstraintData, TemplateScalarConstraint)):
+            n_t += len(con)
+        else:
+            n_c += len(con)
+    result["has_templates"] = model_has_templates(m_on)
+    result["templatized_rows"] = n_t
+    result["classic_rows"] = n_c
+
+    st = stages.model_stats(m_on)
+    st["nnz"] = stages.constraint_matrix_nnz(m_on)
+    result["stats"] = st
+    result["stages"] = {
+        "construct_off": con_off.as_dict(),
+        "construct_on": con_on.as_dict(),
+        "load_highs": load_off.as_dict(),
+        "fastload_off": fast_off.as_dict(),
+        "fastload_on": fast_on.as_dict(),
+    }
+
+    # --- derived speedups ---------------------------------------------------- #
+    co, cn = con_off.median_ms, con_on.median_ms
+    result["construct_speedup"] = round(co / cn, 3) if cn else None
+    classic_coherent = co + load_off.median_ms
+    phase2 = co + fast_off.median_ms
+    phase3 = cn + fast_on.median_ms
+    result["classic_coherent_ms"] = round(classic_coherent, 3)
+    result["phase2_build_to_solver_ms"] = round(phase2, 3)
+    result["phase3_build_to_solver_ms"] = round(phase3, 3)
+    result["end_to_end_vs_classic"] = (
+        round(classic_coherent / phase3, 3) if phase3 else None
+    )
+    result["end_to_end_vs_phase2"] = round(phase2 / phase3, 3) if phase3 else None
+
+    if validate:
+        result["validation"] = _validate_template(mod, build_params, is_quad)
+    return result
+
+
+def _validate_template(mod, build_params, is_quad: bool) -> Dict[str, Any]:
+    """Solve-equivalence gate for the template leg, without cloning.
+
+    A model built with template-vectorized construction cannot currently be
+    ``clone()``d (an upstream limitation of the experimental template-expression
+    feature -- deepcopy of a ``TemplateSumExpression`` recurses).  So instead of
+    cloning one model, we build two fresh ones: a classic (switch-off) build
+    solved via APPSI HiGHS, and a switch-on build solved via ``highs_fastload``
+    (the vectorized route), and check their objectives agree."""
+    from bench.harness import stages
+
+    out: Dict[str, Any] = {}
+    try:
+        m_classic = mod.build_pyomo(build_params)
+        res = stages.solve_highs(m_classic)
+        out["termination"] = str(getattr(res, "termination_condition", "n/a"))
+        out["objective"] = _active_obj_value(m_classic)
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
+
+    if is_quad:
+        out["fastload_skipped"] = "quadratic (linear fast route rejects by design)"
+        return out
+
+    try:
+        from pyomo.contrib.vector.template_vectorize import vectorized_construction
+        from pyomo.contrib.solver.common.factory import SolverFactory
+        from pyomo.contrib.solver.common.results import TerminationCondition
+
+        with vectorized_construction():
+            m_on = mod.build_pyomo(build_params)
+        r = SolverFactory('highs_fastload').solve(
+            m_on, raise_exception_on_nonoptimal_result=False
         )
         out["fastload_termination"] = str(r.termination_condition)
         out["fastload_objective"] = (
@@ -563,6 +754,8 @@ def run_single(spec: Dict[str, Any]) -> Dict[str, Any]:
     try:
         if backend == "pyomo":
             r = run_pyomo_case(model, size, params, repeats, warmup, validate)
+        elif backend == "pyomo_template":
+            r = run_pyomo_template_case(model, size, params, repeats, warmup, validate)
         elif backend == "pyomo_vector":
             r = run_pyomo_vector_case(model, size, params, repeats, warmup, validate)
         elif backend == "linopy":
@@ -631,6 +824,23 @@ def _plan(
                     # value is characterizing repn/write behaviour, not scaling.
                     # Cap it at 1e5 (1e6 quadratic is slow and low-signal).
                     if model == "facility_location_q" and size in ("1e6", "1e7"):
+                        continue
+                    specs.append(
+                        {
+                            "backend": backend,
+                            "model": model,
+                            "size": size,
+                            "params": dict(model_sizes[size]),
+                            "repeats": repeats_for(size),
+                            "warmup": warmup,
+                            "validate": small(size),
+                        }
+                    )
+        elif backend == "pyomo_template":
+            for model in [m for m in models if m in TEMPLATE_MODEL_NAMES]:
+                model_sizes = _sizes_for(model)
+                for size in sizes:
+                    if size not in model_sizes:
                         continue
                     specs.append(
                         {

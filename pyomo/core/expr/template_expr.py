@@ -11,7 +11,7 @@ import itertools
 import logging
 import sys
 import builtins
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 from pyomo.common.collections import MutableMapping
 from pyomo.common.dependencies import attempt_import
@@ -49,6 +49,29 @@ pyomo_core_base_set, _ = attempt_import('pyomo.core.base.set')
 pyomo_core_base_param, _ = attempt_import('pyomo.core.base.param')
 
 logger = logging.getLogger(__name__)
+
+# When True, ``templatize_rule`` does not log an ERROR for a rule that fails to
+# templatize.  Opportunistic callers (the ``TEMPLATIZE_CONSTRAINTS`` construction
+# fast path and the vectorized-compile path in ``pyomo.contrib.vector``) set this
+# via :func:`suppress_templatization_errors`, because for them a rule that does
+# not templatize is an expected, silently-handled fallback -- not an error.
+_SUPPRESS_TEMPLATIZATION_ERRORS = False
+
+
+@contextmanager
+def suppress_templatization_errors():
+    """Silence the ERROR ``templatize_rule`` logs when a rule does not templatize.
+
+    Use around an *opportunistic* templatization attempt whose failure is handled
+    by falling back to classic construction, so the fallback stays quiet.
+    """
+    global _SUPPRESS_TEMPLATIZATION_ERRORS
+    prev = _SUPPRESS_TEMPLATIZATION_ERRORS
+    _SUPPRESS_TEMPLATIZATION_ERRORS = True
+    try:
+        yield
+    finally:
+        _SUPPRESS_TEMPLATIZATION_ERRORS = prev
 
 
 def _validate_generator(generator):
@@ -1266,7 +1289,7 @@ def templatize_rule(block, rule, index_set):
         raise
     finally:
         if len(context.cache):
-            if internal_error is not None:
+            if internal_error is not None and not _SUPPRESS_TEMPLATIZATION_ERRORS:
                 logger.error(
                     "The following exception was raised when "
                     "templatizing the rule '%s':\n\t%s"

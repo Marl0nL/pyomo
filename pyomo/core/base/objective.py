@@ -13,7 +13,6 @@ from weakref import ref as weakref_ref
 from pyomo.common.pyomo_typing import overload
 
 from pyomo.common.deprecation import RenamedClass, deprecated
-from pyomo.common.errors import TemplateExpressionError
 from pyomo.common.enums import ObjectiveSense, minimize, maximize
 from pyomo.common.log import is_debug_set
 from pyomo.common.modeling import NOTSET
@@ -22,7 +21,10 @@ from pyomo.common.timing import ConstructionTimer
 
 from pyomo.core.expr.expr_common import _type_check_exception_arg
 from pyomo.core.expr.numvalue import value
-from pyomo.core.expr.template_expr import templatize_rule
+from pyomo.core.expr.template_expr import (
+    templatize_rule,
+    suppress_templatization_errors,
+)
 from pyomo.core.base.component import ActiveComponentData, ModelComponentFactory
 from pyomo.core.base.disable_methods import disable_methods
 from pyomo.core.base.global_set import UnindexedComponent_index
@@ -330,8 +332,30 @@ class Objective(ActiveIndexedComponent):
                 pass
             else:
                 if TEMPLATIZE_OBJECTIVES:
+                    template_info = None
                     try:
-                        template_info = templatize_rule(block, rule, self.index_set())
+                        with suppress_templatization_errors():
+                            template_info = templatize_rule(
+                                block, rule, self.index_set()
+                            )
+                    except Exception:
+                        # Opportunistic fast path: any failure to templatize
+                        # (a non-templatizable objective rule) falls back to
+                        # classic per-index construction below, which is the
+                        # ground truth (mirrors Constraint.construct; scoping
+                        # doc Sec 6.5).
+                        if is_debug_set(logger):
+                            logger.debug(
+                                "Objective %s did not templatize; falling back "
+                                "to classic per-index construction (%s: %s)"
+                                % (
+                                    self.name,
+                                    type(sys.exc_info()[1]).__name__,
+                                    sys.exc_info()[1],
+                                )
+                            )
+                        template_info = None
+                    if template_info is not None:
                         if self.is_indexed():
                             comp = weakref_ref(self)
                             self._data = {
@@ -350,8 +374,6 @@ class Objective(ActiveIndexedComponent):
                             self._data = {None: self}
                             self.set_sense(self._init_sense(self, self.index()))
                         return
-                    except TemplateExpressionError:
-                        pass
 
                 # Bypass the index validation and create the member directly
                 for index in self.index_set():

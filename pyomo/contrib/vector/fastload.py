@@ -177,7 +177,22 @@ def compile_to_highs_arrays(model):
     Raises :class:`IncompatibleModelError` if the model is not linear or contains
     components the standard-form compiler cannot process; the message points at
     the classic solver route so the user is never silently given a wrong answer.
+
+    If the model was built with template-vectorized construction
+    (:func:`pyomo.contrib.vector.template_vectorize.vectorized_construction`),
+    every constraint family that templatizes is compiled by *vectorized*
+    extraction (NumPy over the whole index set) and the rest by the classic
+    per-row repn, over one shared column space -- construction and load both stay
+    array-shaped end-to-end (Phase-3).
     """
+    from pyomo.contrib.vector.template_vectorize import (
+        model_has_templates,
+        compile_templated_to_highs_arrays,
+    )
+
+    if model_has_templates(model):
+        return compile_templated_to_highs_arrays(model)
+
     from pyomo.repn.plugins.standard_form import LinearStandardFormCompiler
     from pyomo.common.errors import InvalidConstraintError, InvalidExpressionError
 
