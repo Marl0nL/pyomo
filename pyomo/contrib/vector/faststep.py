@@ -771,6 +771,70 @@ class _MatrixGuard:
         return "\n".join(lines)
 
 
+def _build_param_reader(params):
+    """Partition a parameter list into a columnar-aware bulk reader.
+
+    Reading the parameter vector is on the warm-tick hot path (once per solve,
+    plus the value-guard leg).  A classic ``ParamData`` reads its value from a
+    plain slot; a *columnar* ``VectorParamData`` dereferences a weakref to its
+    component and indexes the component's value column on every ``.value`` -- so a
+    Python ``p.value`` loop over a large switch-ON parameter vector is markedly
+    slower than the classic one (measured ~3x per read).
+
+    This gathers every columnar parameter that shares a value column into one
+    vectorized slice of that column, keyed once here, and leaves classic
+    parameters to the per-object read.  Returns ``None`` when there are no
+    columnar parameters, so a classic model keeps the original ``np.fromiter``
+    path unchanged.
+    """
+    scalar = []
+    col_by_comp = {}  # id(component) -> [component, dst_positions, src_positions]
+    for k, p in enumerate(params):
+        pos = getattr(p, '_pos', None)
+        comp = p.parent_component() if pos is not None else None
+        # A columnar VectorParamData exposes ``_pos`` and its component owns the
+        # ``_value_arr`` value column; anything else is read per-object.
+        if pos is not None and getattr(comp, '_value_arr', None) is not None:
+            entry = col_by_comp.get(id(comp))
+            if entry is None:
+                entry = [comp, [], []]
+                col_by_comp[id(comp)] = entry
+            entry[1].append(k)
+            entry[2].append(pos)
+        else:
+            scalar.append((k, p))
+    if not col_by_comp:
+        return None
+    columnar = [
+        (comp, np.asarray(dst, dtype=np.intp), np.asarray(src, dtype=np.intp))
+        for comp, dst, src in col_by_comp.values()
+    ]
+    return scalar, columnar
+
+
+def _gather_param_values(params, reader):
+    """Read the current values of ``params`` into a float64 array.
+
+    ``reader`` is ``None`` (all-classic: a simple per-object read) or the
+    ``(scalar, columnar)`` partition from :func:`_build_param_reader`.  The
+    columnar slice ``comp._value_arr[src]`` returns exactly the float64 values a
+    per-object ``VectorParamData.value`` would (the value column is the single
+    source of truth), so the result is bit-identical to the classic read.  The
+    component's ``_value_arr`` is fetched at read time, so an in-place mutation --
+    or a wholesale column replacement -- between ticks is always reflected.
+    """
+    n = len(params)
+    if reader is None:
+        return np.fromiter((p.value for p in params), dtype=np.float64, count=n)
+    scalar, columnar = reader
+    out = np.empty(n, dtype=np.float64)
+    for k, p in scalar:
+        out[k] = p.value
+    for comp, dst, src in columnar:
+        out[dst] = comp._value_arr[src]
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # The mutable-update plan
 # --------------------------------------------------------------------------- #
@@ -797,19 +861,17 @@ class _MutablePlan:
         'matrix_guard',
         'folded_params',
         'folded_baseline',
+        # Columnar-aware bulk readers (None => the simple per-Param path); built
+        # once from ``params`` / ``folded_params`` at plan construction.
+        '_param_reader',
+        '_folded_reader',
     )
 
     def read_param_vector(self):
-        return np.fromiter(
-            (p.value for p in self.params), dtype=np.float64, count=len(self.params)
-        )
+        return _gather_param_values(self.params, self._param_reader)
 
     def read_folded_vector(self):
-        return np.fromiter(
-            (p.value for p in self.folded_params),
-            dtype=np.float64,
-            count=len(self.folded_params),
-        )
+        return _gather_param_values(self.folded_params, self._folded_reader)
 
     @property
     def has_residual(self):
@@ -831,6 +893,231 @@ class _MutablePlan:
 def _active_objective(model):
     objs = list(model.component_data_objects(Objective, active=True, descend_into=True))
     return objs[0] if objs else None
+
+
+def _classic_constraint_slots(compiled, resolve_col):
+    """Collect the mutable constraint slots from a *classic* (non-templatized)
+    compile.
+
+    ``compiled.rows`` is ``[(ConstraintData, multiplier), ...]`` from the proven
+    mixed-form path (a range row split into two ``+/-1`` rows that share one
+    body).  Returns the seven parallel slot lists the plan tail consumes.  The
+    body/slot logic is byte-for-byte the pre-refactor inline loop.
+    """
+    # id(constraint) -> the A-row index/indices it maps to (a range row splits
+    # into two rows that share one body, so both carry the same coefficients).
+    con_rows = {}
+    for i, (con, _mult) in enumerate(compiled.rows):
+        con_rows.setdefault(id(con), []).append(i)
+
+    row_idx = []
+    row_lower_slots = []
+    row_upper_slots = []
+    mat_rows = []
+    mat_cols = []
+    mat_slots = []
+    mat_prov = []
+    body_cache = {}
+    for i, (con, mult) in enumerate(compiled.rows):
+        cid = id(con)
+        repn = body_cache.get(cid)
+        if repn is None:
+            repn = generate_standard_repn(
+                con.body, quadratic=False, compute_values=False
+            )
+            if repn.nonlinear_expr is not None:
+                raise IncompatibleModelError(
+                    f"The '{FastStepHighs.name}' warm interface only supports linear "
+                    "constraints."
+                )
+            # A *mutable* coefficient on a free variable is a mutable A-entry.
+            # Rather than reject the model on the flag, capture it into the value
+            # guard (one entry per A-row the constraint occupies -- a range row
+            # occupies two, both with the same body coefficients).
+            for coef, v in zip(repn.linear_coefs, repn.linear_vars):
+                j = resolve_col(v)
+                if j is not None and not is_constant(coef):
+                    for ri in con_rows[cid]:
+                        mat_rows.append(ri)
+                        mat_cols.append(j)
+                        mat_slots.append(coef)
+                        # Store the components, not their names: ``.name`` is
+                        # resolved lazily in _MatrixGuard.describe (fail-loud only).
+                        mat_prov.append((con, v, coef))
+            body_cache[cid] = repn
+        offset = repn.constant
+
+        if mult == 0:  # equality: lower == upper == rhs
+            rhs = con.upper - offset
+            live = None if is_constant(rhs) else rhs
+            if live is not None:
+                row_idx.append(i)
+                row_lower_slots.append(live)
+                row_upper_slots.append(live)
+        elif mult == 1:  # A x <= rhs ; lower open
+            rhs = con.upper - offset
+            if not is_constant(rhs):
+                row_idx.append(i)
+                row_lower_slots.append(None)
+                row_upper_slots.append(rhs)
+        else:  # mult == -1 : A x >= rhs ; upper open
+            rhs = con.lower - offset
+            if not is_constant(rhs):
+                row_idx.append(i)
+                row_lower_slots.append(rhs)
+                row_upper_slots.append(None)
+    return (
+        row_idx,
+        row_lower_slots,
+        row_upper_slots,
+        mat_rows,
+        mat_cols,
+        mat_slots,
+        mat_prov,
+    )
+
+
+def _refs_mutable_param(cd):
+    """True if a constraint datum's body or either bound references a mutable
+    Param.
+
+    A templatized family's rows are structurally uniform (an index-conditional or
+    otherwise non-uniform rule cannot templatize -- it falls back to the classic
+    per-row path), so a single materialized row decides the whole family.  Uses
+    the generator's first yield and never puts a ParamData in a set (a *columnar*
+    ``VectorParamData`` is unhashable).
+    """
+    for _ in identify_mutable_parameters(cd.body):
+        return True
+    for bnd in (cd.lower, cd.upper):
+        if bnd is not None and bnd.__class__ is not float and bnd.__class__ is not int:
+            for _ in identify_mutable_parameters(bnd):
+                return True
+    return False
+
+
+def _templated_constraint_slots(compiled, resolve_col):
+    """Collect the mutable constraint slots from a *templatized* (switch-ON)
+    compile.
+
+    ``compiled.rows`` is ``[(family_or_data, local_row), ...]``: a templatized
+    family contributes ``(IndexedConstraint, r)`` rows (there is no per-row
+    ``.body`` -- the family carries the template), while a family that could not
+    vectorize falls back to per-row ``(ConstraintData, 0)``.
+
+    Two facts keep this both correct and cheap:
+
+    * A templatized family always has a *static* coefficient matrix -- a mutable
+      matrix coefficient is index-independent-constant-only on the vectorized
+      path, so it forces the family onto the classic fallback.  A family that
+      references no mutable Param at all therefore has fully static rows and is
+      skipped *without materializing them* (the vectorized construction win
+      survives into the warm compile).
+    * A materialized row's symbolic ``.body`` / ``.lower`` / ``.upper`` feed the
+      exact same slot machinery the classic path uses, and the plan self-check
+      then validates every affine template against the compiled numeric arrays --
+      so a wrong slot fails loud, never silently.
+
+    Range direction is read from the constraint (``equality`` / open side) rather
+    than a mixed-form multiplier: the templatized compile emits HiGHS-native range
+    rows (one per constraint, never split), so ``compiled.rows[i][1]`` is a local
+    row index, not a ``+/-1`` multiplier.
+    """
+    row_idx = []
+    row_lower_slots = []
+    row_upper_slots = []
+    mat_rows = []
+    mat_cols = []
+    mat_slots = []
+    mat_prov = []
+
+    def _process_row(i, cd):
+        repn = generate_standard_repn(cd.body, quadratic=False, compute_values=False)
+        if repn.nonlinear_expr is not None:
+            raise IncompatibleModelError(
+                f"The '{FastStepHighs.name}' warm interface only supports linear "
+                "constraints."
+            )
+        # A mutable matrix coefficient (only reachable on a classic-fallback row --
+        # a templatized family's coefficients are static) is captured into the
+        # value guard, exactly as on the classic path.
+        for coef, v in zip(repn.linear_coefs, repn.linear_vars):
+            j = resolve_col(v)
+            if j is not None and not is_constant(coef):
+                mat_rows.append(i)
+                mat_cols.append(j)
+                mat_slots.append(coef)
+                mat_prov.append((cd, v, coef))
+        offset = repn.constant
+        lb = cd.lower
+        ub = cd.upper
+        if cd.equality:  # lower == upper == rhs
+            rhs = ub - offset
+            if not is_constant(rhs):
+                row_idx.append(i)
+                row_lower_slots.append(rhs)
+                row_upper_slots.append(rhs)
+        elif lb is None:  # A x <= ub ; lower open
+            rhs = ub - offset
+            if not is_constant(rhs):
+                row_idx.append(i)
+                row_lower_slots.append(None)
+                row_upper_slots.append(rhs)
+        elif ub is None:  # A x >= lb ; upper open
+            rhs = lb - offset
+            if not is_constant(rhs):
+                row_idx.append(i)
+                row_lower_slots.append(rhs)
+                row_upper_slots.append(None)
+        else:  # genuine two-sided range: lb <= A x <= ub
+            lb_slot = lb - offset
+            ub_slot = ub - offset
+            lb_mut = not is_constant(lb_slot)
+            ub_mut = not is_constant(ub_slot)
+            if lb_mut or ub_mut:
+                row_idx.append(i)
+                row_lower_slots.append(lb_slot if lb_mut else float(value(lb_slot)))
+                row_upper_slots.append(ub_slot if ub_mut else float(value(ub_slot)))
+
+    def _materialize(family, index):
+        cd = family[index]
+        if hasattr(cd, 'template_expr'):
+            cd.expr  # expand the stored template into a concrete per-index expression
+        return cd
+
+    N = len(compiled.rows)
+    i = 0
+    while i < N:
+        con = compiled.rows[i][0]
+        if hasattr(con, 'body'):
+            # A non-vectorizable family fell back to a per-row ConstraintData.
+            _process_row(i, con)
+            i += 1
+            continue
+        # A templatized family occupies the contiguous run of rows keyed to it;
+        # ``compiled.rows[k][1]`` is the local row index into ``con.index_set()``.
+        fid = id(con)
+        run = []
+        while i < N and id(compiled.rows[i][0]) == fid:
+            run.append(i)
+            i += 1
+        index_list = list(con.index_set())
+        cd0 = _materialize(con, index_list[compiled.rows[run[0]][1]])
+        if _refs_mutable_param(cd0):
+            for ii in run:
+                cd = _materialize(con, index_list[compiled.rows[ii][1]])
+                _process_row(ii, cd)
+        # else: a fully static family -- its rows never change across warm rolls,
+        # so it contributes no slots and is not materialized past the probe row.
+    return (
+        row_idx,
+        row_lower_slots,
+        row_upper_slots,
+        mat_rows,
+        mat_cols,
+        mat_slots,
+        mat_prov,
+    )
 
 
 def _build_mutable_plan(model, compiled: FastLoadCompiled):
@@ -861,12 +1148,6 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
         if pos is not None:
             return scatter_of.get((id(v.parent_component()), pos))
         return None
-
-    # id(constraint) -> the A-row index/indices it maps to (a range row splits
-    # into two rows that share one body, so both carry the same coefficients).
-    con_rows = {}
-    for i, (con, _mult) in enumerate(compiled.rows):
-        con_rows.setdefault(id(con), []).append(i)
 
     # --- collect the mutable slots (expressions / constants) per group ------ #
     obj_cols = []
@@ -908,68 +1189,46 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
                 if not is_constant(qcoef):
                     quad_param_slots.append(qcoef)
 
-    row_idx = []
-    row_lower_slots = []
-    row_upper_slots = []
-    # Guarded matrix coefficients, collected per (row, col) A-entry.
-    mat_rows = []
-    mat_cols = []
-    mat_slots = []
-    mat_prov = []
-    body_cache = {}
-    for i, (con, mult) in enumerate(compiled.rows):
-        cid = id(con)
-        repn = body_cache.get(cid)
-        if repn is None:
-            repn = generate_standard_repn(
-                con.body, quadratic=False, compute_values=False
-            )
-            if repn.nonlinear_expr is not None:
-                raise IncompatibleModelError(
-                    f"The '{FastStepHighs.name}' warm interface only supports linear "
-                    "constraints."
-                )
-            # A *mutable* coefficient on a free variable is a mutable A-entry.
-            # Rather than reject the model on the flag, capture it into the value
-            # guard (one entry per A-row the constraint occupies -- a range row
-            # occupies two, both with the same body coefficients).
-            for coef, v in zip(repn.linear_coefs, repn.linear_vars):
-                j = _resolve_col(v)
-                if j is not None and not is_constant(coef):
-                    for ri in con_rows[cid]:
-                        mat_rows.append(ri)
-                        mat_cols.append(j)
-                        mat_slots.append(coef)
-                        # Store the components, not their names: ``.name`` is
-                        # resolved lazily in _MatrixGuard.describe (fail-loud only).
-                        mat_prov.append((con, v, coef))
-            body_cache[cid] = repn
-        offset = repn.constant
+    # The constraint slots come from one of two collectors, matching the branch
+    # ``compile_to_highs_arrays`` itself took: a templatized (switch-ON) compile
+    # carries ``(family, local_row)`` rows whose bodies are not materialized per
+    # row, so it needs the template-aware collector; a classic compile carries the
+    # mixed-form ``(ConstraintData, multiplier)`` rows.  Both return the identical
+    # slot lists, and everything below (folding / registry / affine templates /
+    # self-check / value guard) is shared -- the self-check validates whichever
+    # collector ran against the compiled numeric arrays.
+    from pyomo.contrib.vector.template_vectorize import model_has_templates
 
-        if mult == 0:  # equality: lower == upper == rhs
-            rhs = con.upper - offset
-            live = None if is_constant(rhs) else rhs
-            if live is not None:
-                row_idx.append(i)
-                row_lower_slots.append(live)
-                row_upper_slots.append(live)
-        elif mult == 1:  # A x <= rhs ; lower open
-            rhs = con.upper - offset
-            if not is_constant(rhs):
-                row_idx.append(i)
-                row_lower_slots.append(None)
-                row_upper_slots.append(rhs)
-        else:  # mult == -1 : A x >= rhs ; upper open
-            rhs = con.lower - offset
-            if not is_constant(rhs):
-                row_idx.append(i)
-                row_lower_slots.append(rhs)
-                row_upper_slots.append(None)
+    if model_has_templates(model):
+        (
+            row_idx,
+            row_lower_slots,
+            row_upper_slots,
+            mat_rows,
+            mat_cols,
+            mat_slots,
+            mat_prov,
+        ) = _templated_constraint_slots(compiled, _resolve_col)
+    else:
+        (
+            row_idx,
+            row_lower_slots,
+            row_upper_slots,
+            mat_rows,
+            mat_cols,
+            mat_slots,
+            mat_prov,
+        ) = _classic_constraint_slots(compiled, _resolve_col)
 
     col_idx = []
     col_lower_slots = []
     col_upper_slots = []
     for j, v in enumerate(compiled.columns):
+        if v is None:
+            # A *columnar* Var owns this column: its bounds live in the
+            # component's float arrays (no mutable-Param bound is representable
+            # there), so the column is static -- nothing to template.
+            continue
         lb = v.lower
         ub = v.upper
         lb_mut = lb is not None and not is_constant(lb)
@@ -1074,9 +1333,11 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
     plan.params = params
     plan.param_index = param_index
     plan.folded_params = folded_params
-    plan.folded_baseline = np.fromiter(
-        (p.value for p in folded_params), dtype=np.float64, count=len(folded_params)
-    )
+    # Columnar-aware bulk readers for the two hot-path reads (a classic model
+    # keeps the per-Param path -- these are ``None``).
+    plan._param_reader = _build_param_reader(params)
+    plan._folded_reader = _build_param_reader(folded_params)
+    plan.folded_baseline = plan.read_folded_vector()
     plan.obj_cols = np.fromiter(obj_cols, dtype=np.int32, count=len(obj_cols))
     plan.obj_affine = _build_affine_array(
         obj_slots,
@@ -1916,7 +2177,15 @@ class FastStepHighs:
         results.solver_config = self.config
         results.timing_info.highs_time = highs.getRunTime()
         loader = FastLoadHighsSolutionLoader(
-            highs, self._model, compiled.columns, compiled.rows
+            highs,
+            self._model,
+            compiled.columns,
+            compiled.rows,
+            # A switch-ON compile owns some columns via *columnar* Vars (a ``None``
+            # in ``columns``); the bulk scatter maps their solution back without
+            # materializing a per-index VarData.  Omitting it left columnar Vars
+            # uninitialized after a warm solve.
+            column_scatter=compiled.column_scatter,
         )
         self._loader = loader
         results.solution_loader = loader

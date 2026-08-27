@@ -29,7 +29,7 @@ import pyomo.contrib.vector   # importing registers highs_fastload / gurobi_fast
 | a model you're building from scratch, in matrix form | maximum build+load speed, full array control | **explicit-array API** — `VectorVar` / `VectorConstraint` / `VectorObjective` + `solve_highs` | `bench/PHASE0_REPORT.md` |
 | an **unmodified classic** linear/MIP/convex-QP model | solve it faster with **no model change** | **`SolverFactory('highs_fastload')`** (or `gurobi_fastload`) | `bench/PHASE2_REPORT.md`, `bench/GUROBI_FASTLOAD_REPORT.md` |
 | classic `Constraint(index, rule=...)` code | make **construction** faster too, no rewrite | **`vectorized_construction()`** switch + `highs_fastload` | `bench/PHASE3_REPORT.md` |
-| a rolling-horizon / MPC loop (re-solve thousands of times) | warm re-solve pushing changed data as arrays | **`FastStepHighs`** | `bench/PHASE4_REPORT.md` |
+| a rolling-horizon / MPC loop (re-solve thousands of times), classic **or** `vectorized_construction()`-built | warm re-solve pushing changed data as arrays | **`FastStepHighs`** | `bench/PHASE4_REPORT.md`, `bench/FASTSTEP_TEMPLATIZED_REPORT.md` |
 | an all-vector model you mutate between solves | warm re-solve driven by columnar mutation | **`VectorPersistentHighs`** | `bench/PHASE2_REPORT.md` |
 | a convex-quadratic **objective** (`c·x + ½·xᵀQx`) | build & solve it array-native | `VectorObjective(quadratic=Q)` or `highs_fastload` | `bench/QUADRATIC_QP_REPORT.md` |
 
@@ -232,6 +232,40 @@ stepper.solve(param_values=P, dirty=mask)        # only the changed parameters' 
 constraint matrix `A` is treated as static (see the guard/fold knobs below).
 **When it wins:** **2.33× at the 1e5-nnz class** (3.39× at 1e4) vs the persistent
 APPSI HiGHS interface, clearing the ≥1.4× target with margin (`bench/PHASE4_REPORT.md`).
+
+### Composing with the construction switch (`vectorized_construction()`)
+
+`FastStepHighs` warm-re-solves a model built **with the Phase-3 switch on** (§2)
+exactly as it does a classic one — `set_instance` reads the templatized constraint
+families and columnar Var/Param stores directly, so a switch-ON build gets the
+program's best construction *and* its best warm re-solve in one pipeline. There is
+nothing extra to call: build under `vectorized_construction()`, hand the model to
+`set_instance`, and roll.
+
+```python
+from pyomo.contrib.vector import vectorized_construction, FastStepHighs
+
+with vectorized_construction():          # templatized families + columnar Var/Param
+    m = build_rolling_model()            # your classic Constraint(index, rule=...) code
+stepper = FastStepHighs()
+stepper.set_instance(m)                  # feeds templates/columns to the warm compile
+for roll in range(horizon):
+    update_params(m, roll)               # mutate mutable Params in place
+    stepper.solve()                      # same warm loop, same results as switch-off
+```
+
+A switch-ON build warm-solves **bit-for-bit** the same sequence as the equivalent
+switch-off build (objective and primals, both basis-kept and basis-reset), the
+one-time `set_instance` compile is **no slower** than switch-off (at parity, ~0.95×
+at scale — a fully static templatized family is skipped without materializing its
+rows), and the **warm tick is faster** (~0.63× at scale: columnar Params are read
+back in one vectorized gather per component rather than object-by-object). See
+`bench/FASTSTEP_TEMPLATIZED_REPORT.md`. Every mechanism below (matrix guard,
+folding, the array path) applies unchanged. One representation limit carries over
+from the switch: a *columnar* Var cannot hold a mutable-`Param` bound, so declare
+such a bound with a `bounds=` rule (which keeps that one Var classic) — the
+surrounding constraint families still templatize, though that Var's per-index
+compile makes `set_instance` modestly slower (the warm tick stays faster).
 
 ### Transparency knobs — the static-matrix guard & parameter folding
 

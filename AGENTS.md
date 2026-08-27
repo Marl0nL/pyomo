@@ -18,9 +18,13 @@ construction** (`pyomo/contrib/vector/varparam.py`): a classic `Var`/`Param` wit
 vectorizable args builds into NumPy columns (materialize-on-touch), skipping the
 per-index data object; per-index callables fall back to byte-classic. Activation
 is a runtime monkeypatch of `Var.construct`/`Param.construct` — **no `pyomo/core/*`
-edit** — so switch-off is byte-classic. See `bench/VARPARAM_REPORT.md`. Known gap:
-`faststep` over a *templatized* (switch-on) model is a pre-existing Phase-3/4
-incompatibility (templatized `compiled.rows` carry the family, not per-row bodies). The whole program is consolidated in two docs: the
+edit** — so switch-off is byte-classic. See `bench/VARPARAM_REPORT.md`. `faststep`
+**does** warm re-solve a templatized (switch-on) model: `_build_mutable_plan`
+dispatches to a template-aware constraint-slot collector (static families skipped,
+mutable-RHS families materialized, columnar Params bulk-read), bit-exact vs
+switch-off, set_instance no slower + warm tick faster (`bench/FASTSTEP_TEMPLATIZED_REPORT.md`);
+the one carry-over limit is that a columnar Var can't hold a mutable-`Param` bound
+(declare it with a `bounds=` rule → that Var stays classic). The whole program is consolidated in two docs: the
 PEP-style upstream proposal `docs/vector_proposal.md` (design, evidence,
 compatibility contract, `contrib → core` migration split — every number cited from
 a committed `bench/` report) and the user guide `pyomo/contrib/vector/README.md`
@@ -72,9 +76,10 @@ The ragged `supply_chain` runs the full vector fast path via
 - Benchmarks run in a machine-local venv `bench/.venv` (recreate per `bench/README.md`;
   needs numpy/scipy/highspy, gurobipy optional). Cold-stage + vector-path benches via
   `bench/run_bench.py` (`--backends pyomo,pyomo_vector`), the warm-tick bench via
-  `python -m bench.warm_faststep`, the mutation-cycle bench via `python -m bench.mutation_cycle`.
+  `python -m bench.warm_faststep`, the mutation-cycle bench via `python -m bench.mutation_cycle`,
+  the faststep-over-switch-on bench via `python -m bench.faststep_templatized` (`--mutbound` for the mixed case).
 - Tests: `pytest pyomo/contrib/vector/tests/` (mutation: `test_mutation.py`,
-  sparse/ragged index: `test_sparse.py`).
+  sparse/ragged index: `test_sparse.py`, faststep-over-switch-on: `test_faststep_templatized.py`).
 
 ## Maintaining this file
 
