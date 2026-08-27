@@ -199,12 +199,15 @@ class TestFastLoadSolve(unittest.TestCase):
             self.opt.solve(m)
 
     def test_scope_guard_nonlinear_objective(self):
+        # A genuinely higher-order nonlinear objective (beyond quadratic) is
+        # rejected loudly.  (A convex-quadratic objective is now *supported* --
+        # see test_quadratic.py; a non-convex quadratic is rejected there.)
         from pyomo.contrib.solver.common.util import IncompatibleModelError
 
         m = pyo.ConcreteModel()
         m.x = pyo.Var(bounds=(0, 5))
         m.c = pyo.Constraint(expr=m.x <= 4)
-        m.obj = pyo.Objective(expr=m.x**2, sense=pyo.maximize)
+        m.obj = pyo.Objective(expr=m.x**3, sense=pyo.maximize)
         with self.assertRaises(IncompatibleModelError):
             self.opt.solve(m)
 

@@ -209,6 +209,7 @@ from pyomo.contrib.vector.fastload import (
     FastLoadCompiled,
     FastLoadHighsSolutionLoader,
     build_highs_lp,
+    build_highs_model,
     compile_to_highs_arrays,
 )
 
@@ -853,16 +854,23 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
     obj_cols = []
     obj_slots = []
     obj_offset_slot = None
+    # Mutable Params that feed the (statically-loaded) objective Hessian.  The
+    # warm path never pushes Hessian deltas, so every such Param must be a
+    # watched constant: it is folded and value-guarded exactly like a static
+    # matrix coefficient.  A genuine change to one trips the fold guard (fail-loud,
+    # or -- opt-in -- a full re-fold + reload that rebuilds the Hessian).
+    quad_param_slots = []
     if compiled.has_objective:
         obj = _active_objective(model)
         if obj is not None:
             repn = generate_standard_repn(
-                obj.expr, quadratic=False, compute_values=False
+                obj.expr, quadratic=True, compute_values=False
             )
             if repn.nonlinear_expr is not None:
                 raise IncompatibleModelError(
                     f"The '{FastStepHighs.name}' warm interface only supports linear "
-                    "objectives."
+                    "or convex-quadratic objectives; this objective has "
+                    "higher-order nonlinear terms."
                 )
             for coef, v in zip(repn.linear_coefs, repn.linear_vars):
                 j = col_of.get(id(v))
@@ -876,6 +884,11 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
                     obj_slots.append(coef)
             if not is_constant(repn.constant):
                 obj_offset_slot = repn.constant
+            # The Hessian is loaded once and held fixed across warm rolls: any
+            # Param feeding a quadratic coefficient must therefore be static.
+            for qcoef in getattr(repn, 'quadratic_coefs', ()) or ():
+                if not is_constant(qcoef):
+                    quad_param_slots.append(qcoef)
 
     row_idx = []
     row_lower_slots = []
@@ -1016,6 +1029,27 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
     _register(col_upper_slots)
     _register(mat_slots)
     n_params = len(params)
+
+    # --- objective Hessian: its Params must be static (watched constants) ---- #
+    # The Hessian is loaded once and never pushed as a delta across warm rolls,
+    # so every Param feeding a quadratic coefficient is folded and value-guarded
+    # (like a static matrix coefficient).  If such a Param also *varies* elsewhere
+    # (it is a live template Param), the loaded Hessian would silently go stale
+    # between rolls -- reject loudly rather than warm-solve a stale QP.
+    for qcoef in quad_param_slots:
+        for p in identify_mutable_parameters(qcoef):
+            pid = id(p)
+            if pid in param_index:
+                raise IncompatibleModelError(
+                    f"The '{FastStepHighs.name}' warm interface requires a static "
+                    f"objective Hessian, but parameter '{p.name}' feeds a quadratic "
+                    "objective coefficient and also varies elsewhere in the model. "
+                    "A genuinely varying Hessian is not supported on the warm path; "
+                    "call set_instance again to reload a changed Hessian."
+                )
+            if pid not in folded_seen:
+                folded_seen.add(pid)
+                folded_params.append(p)
 
     # --- affine templates (folded params baked in as constants) ------------- #
     plan = _MutablePlan()
@@ -1393,7 +1427,7 @@ class FastStepHighs:
         compiled = compile_to_highs_arrays(model)
         plan = _build_mutable_plan(model, compiled)  # includes the template self-check
 
-        lp = build_highs_lp(compiled)
+        lp = build_highs_model(compiled)  # HighsModel (with Hessian) for a QP
         highs = highspy.Highs()
         highs.setOptionValue('log_to_console', False)
         self._apply_config_options(highs)
@@ -1599,7 +1633,7 @@ class FastStepHighs:
         ):
             self.set_instance(self._model)
             return
-        lp = build_highs_lp(compiled)
+        lp = build_highs_model(compiled)  # HighsModel (with Hessian) for a QP
         self._highs.passModel(lp)
         self._compiled = compiled
         self._loader = None

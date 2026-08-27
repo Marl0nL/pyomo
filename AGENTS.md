@@ -17,8 +17,14 @@ coefficients via a value-aware guard (verify the values each roll, not the
 mutability flag) — see `bench/VALUEGUARD_REPORT.md` — and engages on models with
 **non-affine** param participation (`price*duration`, `dur/eff`) by **folding**
 the verified-static params as watched constants — see `bench/STATICFOLD_REPORT.md`
-(`FastStepHighs.classification_report()` shows what folded). CI on the fork is
-manual-trigger-only — validate locally.
+(`FastStepHighs.classification_report()` shows what folded). All three routes also
+support a **convex-quadratic objective** (`c@x + 0.5*x@Q@x`, the #1761 use case):
+`VectorObjective(quadratic=Q)` explicit API, `highs_fastload` for a classic
+`x[i]*x[j]` objective, and `highs_faststep` with a *static* Hessian (mutable Q
+params are folded/guarded; varying-Q fails loud). Objective-quadratic only —
+quadratic constraints, MIQP, and non-convex QP fail loud (HiGHS solves convex QP
+only). See `bench/QUADRATIC_QP_REPORT.md`. CI on the fork is manual-trigger-only —
+validate locally.
 
 - Benchmarks run in a machine-local venv `bench/.venv` (recreate per `bench/README.md`);
   run cold-stage benches via `bench/run_bench.py`, the warm-tick bench via
