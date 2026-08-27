@@ -1,0 +1,107 @@
+{
+  "spike": "B_template_expr",
+  "coverage": [
+    {
+      "rule": "a*x[i] <= p[i]",
+      "shape": "scalar-affine",
+      "templatizes": true,
+      "template": "3.0*x[_1]  <=  p[_1]"
+    },
+    {
+      "rule": "2*x[i]-x[i-1] <= 1",
+      "shape": "scalar-affine (neighbour)",
+      "templatizes": true,
+      "template": "2.0*x[_1] - x[_1 - 1]  <=  1.0"
+    },
+    {
+      "rule": "sum(f[j,n,t] for j in N) balance",
+      "shape": "sum-over-set",
+      "templatizes": true,
+      "template": "SUM(f[_3,_1,_2] for _3 in N) - SUM(f[_1,_4,_2] for _4 in N)  ==  0"
+    },
+    {
+      "rule": "if i==0: Skip else affine",
+      "shape": "index-conditional",
+      "templatizes": false,
+      "error": "PyomoException: Cannot convert non-constant Pyomo expression (_1  ==  0) to bool.\nThis error is "
+    },
+    {
+      "rule": "x[i]+x[(i-1)%N]",
+      "shape": "modulo index",
+      "templatizes": false,
+      "error": "TypeError: unsupported operand type(s) for %: 'NPV_SumExpression' and 'int'"
+    },
+    {
+      "rule": "x[i]*x[i] <= 1",
+      "shape": "quadratic",
+      "templatizes": true,
+      "template": "x[_1]*x[_1]  <=  1.0"
+    }
+  ],
+  "affine": {
+    "family": "scalar_affine_ramp",
+    "rows": [
+      {
+        "N": 10000,
+        "n_constraints": 10000,
+        "correct": true,
+        "classic_s": 0.029266153927892447,
+        "resolve_s": 0.1932152439840138,
+        "vectorized_s": 0.002198226982727647,
+        "classic_rows_per_s": 341691.6354857747,
+        "vectorized_rows_per_s": 4549120.758945286,
+        "speedup_vec_over_classic": 13.313526836786366,
+        "speedup_resolve_over_classic": 0.15146917667797405
+      },
+      {
+        "N": 100000,
+        "n_constraints": 100000,
+        "correct": true,
+        "classic_s": 0.30644551396835595,
+        "resolve_s": 1.8710238019702956,
+        "vectorized_s": 0.018926310003735125,
+        "classic_rows_per_s": 326322.28387042455,
+        "vectorized_rows_per_s": 5283650.113533219,
+        "speedup_vec_over_classic": 16.191508746706496,
+        "speedup_resolve_over_classic": 0.163784936164709
+      },
+      {
+        "N": 1000000,
+        "n_constraints": 1000000,
+        "correct": true,
+        "classic_s": 3.3034440909978002,
+        "resolve_s": 18.53856995899696,
+        "vectorized_s": 0.20962979702744633,
+        "classic_rows_per_s": 302714.37095760007,
+        "vectorized_rows_per_s": 4770314.211910782,
+        "speedup_vec_over_classic": 15.758466295539504,
+        "speedup_resolve_over_classic": 0.1781930374513383
+      }
+    ]
+  },
+  "sum_over_set": {
+    "family": "sum_over_set_flow_balance",
+    "rows": [
+      {
+        "N": 10,
+        "T": 100,
+        "n_constraints": 1000,
+        "templatizes": true,
+        "classic_s": 0.016636152984574437,
+        "classic_rows_per_s": 60110.05073872736,
+        "resolve_s": 0.08966549695469439,
+        "speedup_resolve_over_classic": 0.1855357249955381
+      },
+      {
+        "N": 20,
+        "T": 250,
+        "n_constraints": 5000,
+        "templatizes": true,
+        "classic_s": 0.13980275904759765,
+        "classic_rows_per_s": 35764.67327299088,
+        "resolve_s": 0.8350961860269308,
+        "speedup_resolve_over_classic": 0.1674091696104204
+      }
+    ]
+  }
+}

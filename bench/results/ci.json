@@ -1,0 +1,1743 @@
+{
+  "sysinfo": {
+    "python": "3.12.13",
+    "platform": "Linux-6.17.7-ba29.fc43.x86_64-x86_64-with-glibc2.42",
+    "machine": "x86_64",
+    "processor": "x86_64",
+    "cpu_count": 12,
+    "pyomo_repo": "/var/home/marlon/.treehouse/pyomo-808831/3/pyomo",
+    "pyomo_commit": "ceafe484cd6eb842ba102b6942289e8ecba7255a",
+    "packages": {
+      "Pyomo": "6.10.2.dev0",
+      "numpy": "2.5.2",
+      "scipy": "1.18.1",
+      "highspy": "1.15.1",
+      "gurobipy": "13.0.3",
+      "linopy": "0.9.1",
+      "xarray": "2026.7.0",
+      "pandas": "3.0.5"
+    },
+    "pyomo_file": "/var/home/marlon/.treehouse/pyomo-808831/3/pyomo/pyomo/__init__.py"
+  },
+  "suite": "ci",
+  "config": {
+    "backends": [
+      "pyomo",
+      "linopy",
+      "arraynative_highs",
+      "arraynative_gurobi"
+    ],
+    "models": [
+      "network_flow",
+      "unit_commitment",
+      "facility_location",
+      "facility_location_q",
+      "supply_chain"
+    ],
+    "sizes": [
+      "xs",
+      "1e4"
+    ],
+    "repeats": 5,
+    "warmup": 1
+  },
+  "results": [
+    {
+      "backend": "pyomo",
+      "model": "network_flow",
+      "size": "xs",
+      "params": {
+        "N": 8,
+        "T": 6
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 1.4687069924548268,
+          "median_ms": 1.4841269003227353,
+          "mean_ms": 1.486452971585095,
+          "stdev_ms": 0.014056194895860196,
+          "samples_ms": [
+            1.5117,
+            1.4841,
+            1.4687,
+            1.4811,
+            1.4866
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 1.3704380253329873,
+          "median_ms": 1.4337670290842652,
+          "mean_ms": 1.4397292165085673,
+          "stdev_ms": 0.05216128624747504,
+          "samples_ms": [
+            1.4633,
+            1.5242,
+            1.4338,
+            1.4069,
+            1.3704
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 2.4654549779370427,
+          "median_ms": 2.520715002901852,
+          "mean_ms": 2.513282815925777,
+          "stdev_ms": 0.032235094727978045,
+          "samples_ms": [
+            2.5571,
+            2.4655,
+            2.5207,
+            2.49,
+            2.5331
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 5.876027978956699,
+          "median_ms": 5.88746799621731,
+          "mean_ms": 6.192747309493522,
+          "stdev_ms": 0.4398442551461982,
+          "samples_ms": [
+            6.8147,
+            5.8875,
+            5.876
+          ]
+        }
+      },
+      "rss_before_build_mb": 44.65,
+      "stats": {
+        "n_vars": 384,
+        "n_binary": 0,
+        "n_integer": 0,
+        "n_constraints": 48,
+        "nnz": 760
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 19134,
+      "validation": {
+        "termination": "TerminationCondition.optimal",
+        "objective": 128.78428861132448
+      },
+      "total_median_ms": 11.3261,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 130.76
+    },
+    {
+      "backend": "pyomo",
+      "model": "network_flow",
+      "size": "1e4",
+      "params": {
+        "N": 10,
+        "T": 50
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 14.186910935677588,
+          "median_ms": 14.298910973593593,
+          "mean_ms": 14.556679781526327,
+          "stdev_ms": 0.5266304272153227,
+          "samples_ms": [
+            15.5865,
+            14.5006,
+            14.1869,
+            14.2989,
+            14.2104
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 11.78462605457753,
+          "median_ms": 11.898664990440011,
+          "mean_ms": 11.962041398510337,
+          "stdev_ms": 0.2180684504144357,
+          "samples_ms": [
+            11.8364,
+            11.7846,
+            11.901,
+            12.3895,
+            11.8987
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 24.27165990229696,
+          "median_ms": 24.417579057626426,
+          "mean_ms": 24.430691194720566,
+          "stdev_ms": 0.11270293636781817,
+          "samples_ms": [
+            24.6246,
+            24.4094,
+            24.4176,
+            24.2717,
+            24.4303
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 54.13165898062289,
+          "median_ms": 54.270138032734394,
+          "mean_ms": 54.34828131304433,
+          "stdev_ms": 0.2159617046378108,
+          "samples_ms": [
+            54.1317,
+            54.643,
+            54.2701
+          ]
+        }
+      },
+      "rss_before_build_mb": 44.98,
+      "stats": {
+        "n_vars": 5000,
+        "n_binary": 0,
+        "n_integer": 0,
+        "n_constraints": 500,
+        "nnz": 9990
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 266967,
+      "validation": {
+        "termination": "TerminationCondition.optimal",
+        "objective": 1452.1639490585421
+      },
+      "total_median_ms": 104.8853,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 130.43
+    },
+    {
+      "backend": "pyomo",
+      "model": "unit_commitment",
+      "size": "xs",
+      "params": {
+        "G": 6,
+        "T": 10,
+        "min_up": 3
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 1.3288470217958093,
+          "median_ms": 1.3502270448952913,
+          "mean_ms": 1.360945007763803,
+          "stdev_ms": 0.030228124250476725,
+          "samples_ms": [
+            1.4025,
+            1.3907,
+            1.3502,
+            1.3325,
+            1.3288
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 1.7548060277476907,
+          "median_ms": 1.7950469627976418,
+          "mean_ms": 1.807824382558465,
+          "stdev_ms": 0.03677164600010924,
+          "samples_ms": [
+            1.8508,
+            1.795,
+            1.7903,
+            1.8483,
+            1.7548
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 2.6997539680451155,
+          "median_ms": 2.7871340280398726,
+          "mean_ms": 2.7878382010385394,
+          "stdev_ms": 0.07109690110801299,
+          "samples_ms": [
+            2.7871,
+            2.7205,
+            2.6998,
+            2.8459,
+            2.8859
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 10.860246955417097,
+          "median_ms": 10.911128018051386,
+          "mean_ms": 10.89419397370269,
+          "stdev_ms": 0.024004188458568804,
+          "samples_ms": [
+            10.9111,
+            10.8602,
+            10.9112
+          ]
+        }
+      },
+      "rss_before_build_mb": 45.0,
+      "stats": {
+        "n_vars": 180,
+        "n_binary": 60,
+        "n_integer": 0,
+        "n_constraints": 340,
+        "nnz": 870
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 18099,
+      "validation": {
+        "termination": "TerminationCondition.optimal",
+        "objective": 67625.8496992542
+      },
+      "total_median_ms": 16.8435,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 130.41
+    },
+    {
+      "backend": "pyomo",
+      "model": "unit_commitment",
+      "size": "1e4",
+      "params": {
+        "G": 20,
+        "T": 40,
+        "min_up": 3
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 11.935414979234338,
+          "median_ms": 12.023616000078619,
+          "mean_ms": 12.281462806276977,
+          "stdev_ms": 0.5217312700412039,
+          "samples_ms": [
+            13.3164,
+            12.1395,
+            11.9924,
+            12.0236,
+            11.9354
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 17.496693995781243,
+          "median_ms": 17.65093393623829,
+          "mean_ms": 17.62114178854972,
+          "stdev_ms": 0.08671857269016288,
+          "samples_ms": [
+            17.5463,
+            17.4967,
+            17.6509,
+            17.681,
+            17.7309
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 30.111268046312034,
+          "median_ms": 30.14159796293825,
+          "mean_ms": 30.148777971044183,
+          "stdev_ms": 0.038640355417378376,
+          "samples_ms": [
+            30.1487,
+            30.1113,
+            30.1211,
+            30.2212,
+            30.1416
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 130.17361203674227,
+          "median_ms": 130.2441309671849,
+          "mean_ms": 130.34253765363246,
+          "stdev_ms": 0.19121218614163407,
+          "samples_ms": [
+            130.2441,
+            130.6099,
+            130.1736
+          ]
+        }
+      },
+      "rss_before_build_mb": 44.98,
+      "stats": {
+        "n_vars": 2400,
+        "n_binary": 800,
+        "n_integer": 0,
+        "n_constraints": 4740,
+        "nnz": 12500
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 273162,
+      "validation": {
+        "termination": "TerminationCondition.optimal",
+        "objective": 857121.0882803225
+      },
+      "total_median_ms": 190.0603,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 130.43
+    },
+    {
+      "backend": "pyomo",
+      "model": "facility_location",
+      "size": "xs",
+      "params": {
+        "F": 10,
+        "C": 25
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 1.2329479213804007,
+          "median_ms": 1.2435880489647388,
+          "mean_ms": 1.2539738090708852,
+          "stdev_ms": 0.017993603282194452,
+          "samples_ms": [
+            1.2782,
+            1.2425,
+            1.2436,
+            1.2329,
+            1.2727
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 1.6690269112586975,
+          "median_ms": 1.685405964963138,
+          "mean_ms": 1.6898144036531448,
+          "stdev_ms": 0.01501854917775966,
+          "samples_ms": [
+            1.7012,
+            1.7117,
+            1.6854,
+            1.669,
+            1.6817
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 2.7913349913433194,
+          "median_ms": 2.82228400465101,
+          "mean_ms": 2.815976389683783,
+          "stdev_ms": 0.013179924462789167,
+          "samples_ms": [
+            2.8223,
+            2.8136,
+            2.7913,
+            2.8271,
+            2.8255
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 7.620755000971258,
+          "median_ms": 7.664044038392603,
+          "mean_ms": 7.768800986620287,
+          "stdev_ms": 0.1796301342995694,
+          "samples_ms": [
+            8.0216,
+            7.664,
+            7.6208
+          ]
+        }
+      },
+      "rss_before_build_mb": 44.98,
+      "stats": {
+        "n_vars": 260,
+        "n_binary": 10,
+        "n_integer": 0,
+        "n_constraints": 285,
+        "nnz": 1010
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 19523,
+      "validation": {
+        "termination": "TerminationCondition.optimal",
+        "objective": 469.35
+      },
+      "total_median_ms": 13.4153,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 130.43
+    },
+    {
+      "backend": "pyomo",
+      "model": "facility_location",
+      "size": "1e4",
+      "params": {
+        "F": 25,
+        "C": 100
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 9.16932092513889,
+          "median_ms": 9.18965192977339,
+          "mean_ms": 9.41784477327019,
+          "stdev_ms": 0.31942186242133974,
+          "samples_ms": [
+            9.9798,
+            9.5714,
+            9.1693,
+            9.1897,
+            9.1791
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 11.732595041394234,
+          "median_ms": 11.771926074288785,
+          "mean_ms": 11.794355628080666,
+          "stdev_ms": 0.05240540335660358,
+          "samples_ms": [
+            11.7326,
+            11.7592,
+            11.7719,
+            11.8311,
+            11.877
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 21.35333593469113,
+          "median_ms": 21.491504972800612,
+          "mean_ms": 21.470613568089902,
+          "stdev_ms": 0.07855047667976572,
+          "samples_ms": [
+            21.5209,
+            21.3533,
+            21.4128,
+            21.4915,
+            21.5745
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 55.635164957493544,
+          "median_ms": 56.09778396319598,
+          "mean_ms": 56.01008061785251,
+          "stdev_ms": 0.2773352622509412,
+          "samples_ms": [
+            56.0978,
+            56.2973,
+            55.6352
+          ]
+        }
+      },
+      "rss_before_build_mb": 45.02,
+      "stats": {
+        "n_vars": 2525,
+        "n_binary": 25,
+        "n_integer": 0,
+        "n_constraints": 2625,
+        "nnz": 10025
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 202446,
+      "validation": {
+        "termination": "TerminationCondition.optimal",
+        "objective": 1165.799999999999
+      },
+      "total_median_ms": 98.5509,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 130.39
+    },
+    {
+      "backend": "pyomo",
+      "model": "facility_location_q",
+      "size": "xs",
+      "params": {
+        "F": 10,
+        "C": 25
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 1.4626570045948029,
+          "median_ms": 1.4976069796830416,
+          "mean_ms": 1.488552801311016,
+          "stdev_ms": 0.01606761325139794,
+          "samples_ms": [
+            1.5019,
+            1.5036,
+            1.477,
+            1.4627,
+            1.4976
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 2.3407459957525134,
+          "median_ms": 2.3736750008538365,
+          "mean_ms": 2.370363217778504,
+          "stdev_ms": 0.020788777575407723,
+          "samples_ms": [
+            2.3737,
+            2.355,
+            2.4004,
+            2.3407,
+            2.382
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 3.8931119488552213,
+          "median_ms": 4.001531982794404,
+          "mean_ms": 3.991632000543177,
+          "stdev_ms": 0.06439599362520156,
+          "samples_ms": [
+            3.9509,
+            3.8931,
+            4.0015,
+            4.0349,
+            4.0777
+          ]
+        },
+        "load_highs": {
+          "error": "DegreeError: Highs interface does not support expressions of degree None"
+        }
+      },
+      "rss_before_build_mb": 44.87,
+      "stats": {
+        "n_vars": 260,
+        "n_binary": 10,
+        "n_integer": 0,
+        "n_constraints": 285,
+        "nnz": null
+      },
+      "repn_kind": "generate_standard_repn(quadratic=True)",
+      "lp_bytes": 22947,
+      "validation": {
+        "error": "DegreeError: Highs interface does not support expressions of degree None"
+      },
+      "total_median_ms": 7.8728,
+      "total_complete": false,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 130.54
+    },
+    {
+      "backend": "pyomo",
+      "model": "facility_location_q",
+      "size": "1e4",
+      "params": {
+        "F": 25,
+        "C": 100
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 11.527306050993502,
+          "median_ms": 11.625655926764011,
+          "mean_ms": 11.797119583934546,
+          "stdev_ms": 0.362800915822265,
+          "samples_ms": [
+            12.495,
+            11.8029,
+            11.5347,
+            11.6257,
+            11.5273
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 21.9970450270921,
+          "median_ms": 22.54991396330297,
+          "mean_ms": 22.60652359109372,
+          "stdev_ms": 0.4415596897512053,
+          "samples_ms": [
+            21.997,
+            22.3051,
+            23.2341,
+            22.9465,
+            22.5499
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 32.62147307395935,
+          "median_ms": 32.65964309684932,
+          "mean_ms": 32.69658039789647,
+          "stdev_ms": 0.07127649029188794,
+          "samples_ms": [
+            32.8061,
+            32.6215,
+            32.7544,
+            32.6413,
+            32.6596
+          ]
+        },
+        "load_highs": {
+          "error": "DegreeError: Highs interface does not support expressions of degree None"
+        }
+      },
+      "rss_before_build_mb": 44.75,
+      "stats": {
+        "n_vars": 2525,
+        "n_binary": 25,
+        "n_integer": 0,
+        "n_constraints": 2625,
+        "nnz": null
+      },
+      "repn_kind": "generate_standard_repn(quadratic=True)",
+      "lp_bytes": 238912,
+      "validation": {
+        "error": "DegreeError: Highs interface does not support expressions of degree None"
+      },
+      "total_median_ms": 66.8352,
+      "total_complete": false,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 130.66
+    },
+    {
+      "backend": "pyomo",
+      "model": "supply_chain",
+      "size": "xs",
+      "params": {
+        "S": 3,
+        "W": 4,
+        "R": 6,
+        "deg": 2,
+        "T": 5,
+        "seed": 0
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 0.9360979311168194,
+          "median_ms": 1.0040670167654753,
+          "mean_ms": 1.0358257917687297,
+          "stdev_ms": 0.09873194074057678,
+          "samples_ms": [
+            1.2059,
+            0.9528,
+            1.0041,
+            1.0803,
+            0.9361
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 1.0184480343014002,
+          "median_ms": 1.0550579754635692,
+          "mean_ms": 1.0669337818399072,
+          "stdev_ms": 0.045104090193975786,
+          "samples_ms": [
+            1.1448,
+            1.0184,
+            1.0311,
+            1.0551,
+            1.0852
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 1.4565469464287162,
+          "median_ms": 1.4935270883142948,
+          "mean_ms": 1.505992584861815,
+          "stdev_ms": 0.03641694741336044,
+          "samples_ms": [
+            1.5368,
+            1.4565,
+            1.4855,
+            1.5576,
+            1.4935
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 3.3685030648484826,
+          "median_ms": 3.4855930134654045,
+          "mean_ms": 3.478739371833702,
+          "stdev_ms": 0.08734413026825281,
+          "samples_ms": [
+            3.4856,
+            3.3685,
+            3.5821
+          ]
+        }
+      },
+      "rss_before_build_mb": 44.93,
+      "stats": {
+        "n_vars": 130,
+        "n_binary": 0,
+        "n_integer": 0,
+        "n_constraints": 65,
+        "nnz": 256
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 7066,
+      "validation": {
+        "termination": "TerminationCondition.optimal",
+        "objective": 1076.0
+      },
+      "total_median_ms": 7.0382,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 130.48
+    },
+    {
+      "backend": "pyomo",
+      "model": "supply_chain",
+      "size": "1e4",
+      "params": {
+        "S": 8,
+        "W": 12,
+        "R": 20,
+        "deg": 3,
+        "T": 40,
+        "seed": 0
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 10.318169021047652,
+          "median_ms": 10.787748033180833,
+          "mean_ms": 10.820542019791901,
+          "stdev_ms": 0.36968608762644756,
+          "samples_ms": [
+            11.4495,
+            10.8959,
+            10.7877,
+            10.6514,
+            10.3182
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 10.371318086981773,
+          "median_ms": 10.567237972281873,
+          "mean_ms": 10.755433631129563,
+          "stdev_ms": 0.34688698953034003,
+          "samples_ms": [
+            10.4922,
+            10.3713,
+            10.5672,
+            11.1609,
+            11.1855
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 19.553230027668178,
+          "median_ms": 20.07153898011893,
+          "mean_ms": 20.293778204359114,
+          "stdev_ms": 0.565534141150555,
+          "samples_ms": [
+            20.9302,
+            20.978,
+            19.9359,
+            19.5532,
+            20.0715
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 52.128012059256434,
+          "median_ms": 53.46224003005773,
+          "mean_ms": 53.090097343859576,
+          "stdev_ms": 0.6860832172930397,
+          "samples_ms": [
+            53.4622,
+            52.128,
+            53.68
+          ]
+        }
+      },
+      "rss_before_build_mb": 45.0,
+      "stats": {
+        "n_vars": 3200,
+        "n_binary": 0,
+        "n_integer": 0,
+        "n_constraints": 1600,
+        "nnz": 6388
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 192506,
+      "validation": {
+        "termination": "TerminationCondition.optimal",
+        "objective": 22066.0
+      },
+      "total_median_ms": 94.8888,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 130.41
+    },
+    {
+      "backend": "linopy",
+      "model": "network_flow",
+      "size": "xs",
+      "params": {
+        "N": 8,
+        "T": 6
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "build": {
+          "name": "build",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 38.44256105367094,
+          "median_ms": 38.82910998072475,
+          "mean_ms": 38.88736779335886,
+          "stdev_ms": 0.3373304099153149,
+          "samples_ms": [
+            39.3599,
+            38.8291,
+            38.6343,
+            39.1709,
+            38.4426
+          ]
+        },
+        "extract": {
+          "name": "extract",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 0.4796689609065652,
+          "median_ms": 0.510159065015614,
+          "mean_ms": 0.5074749933555722,
+          "stdev_ms": 0.018395734394312538,
+          "samples_ms": [
+            0.5317,
+            0.4952,
+            0.4797,
+            0.5102,
+            0.5207
+          ]
+        }
+      },
+      "rss_before_build_mb": 33.94,
+      "stats": {
+        "n_vars": 384,
+        "n_constraints": 48,
+        "nnz": 760
+      },
+      "total_median_ms": 39.3393,
+      "total_complete": true,
+      "stage_order": [
+        "build",
+        "extract"
+      ],
+      "peak_rss_mb": 190.66,
+      "model_rss_mb": 156.72
+    },
+    {
+      "backend": "linopy",
+      "model": "network_flow",
+      "size": "1e4",
+      "params": {
+        "N": 10,
+        "T": 50
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "build": {
+          "name": "build",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 38.67028001695871,
+          "median_ms": 38.98488997947425,
+          "mean_ms": 38.97483360487968,
+          "stdev_ms": 0.2571251802344387,
+          "samples_ms": [
+            39.3377,
+            39.1683,
+            38.9849,
+            38.6703,
+            38.7129
+          ]
+        },
+        "extract": {
+          "name": "extract",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 0.7236079545691609,
+          "median_ms": 0.7912279106676579,
+          "mean_ms": 0.7862439611926675,
+          "stdev_ms": 0.0384126794575121,
+          "samples_ms": [
+            0.7912,
+            0.8052,
+            0.7715,
+            0.8397,
+            0.7236
+          ]
+        }
+      },
+      "rss_before_build_mb": 33.86,
+      "stats": {
+        "n_vars": 5000,
+        "n_constraints": 500,
+        "nnz": 9990
+      },
+      "total_median_ms": 39.7761,
+      "total_complete": true,
+      "stage_order": [
+        "build",
+        "extract"
+      ],
+      "peak_rss_mb": 192.57,
+      "model_rss_mb": 158.71
+    },
+    {
+      "backend": "linopy",
+      "model": "facility_location",
+      "size": "xs",
+      "params": {
+        "F": 10,
+        "C": 25
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "build": {
+          "name": "build",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 49.44285796955228,
+          "median_ms": 49.631057074293494,
+          "mean_ms": 49.720987398177385,
+          "stdev_ms": 0.3010924636746116,
+          "samples_ms": [
+            49.4817,
+            49.4429,
+            49.6311,
+            49.7736,
+            50.2758
+          ]
+        },
+        "extract": {
+          "name": "extract",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 0.71389798540622,
+          "median_ms": 0.7720980793237686,
+          "mean_ms": 0.7868985878303647,
+          "stdev_ms": 0.06061388328494685,
+          "samples_ms": [
+            0.8874,
+            0.8168,
+            0.7139,
+            0.7442,
+            0.7721
+          ]
+        }
+      },
+      "rss_before_build_mb": 33.73,
+      "stats": {
+        "n_vars": 260,
+        "n_constraints": 285,
+        "nnz": 1010
+      },
+      "total_median_ms": 50.4032,
+      "total_complete": true,
+      "stage_order": [
+        "build",
+        "extract"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 141.68
+    },
+    {
+      "backend": "linopy",
+      "model": "facility_location",
+      "size": "1e4",
+      "params": {
+        "F": 25,
+        "C": 100
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "build": {
+          "name": "build",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 50.0361870508641,
+          "median_ms": 50.162006984464824,
+          "mean_ms": 50.235786591656506,
+          "stdev_ms": 0.21646222192172113,
+          "samples_ms": [
+            50.6342,
+            50.0362,
+            50.162,
+            50.2793,
+            50.0673
+          ]
+        },
+        "extract": {
+          "name": "extract",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 1.0077479528263211,
+          "median_ms": 1.0773279936984181,
+          "mean_ms": 1.058011781424284,
+          "stdev_ms": 0.037335040453518924,
+          "samples_ms": [
+            1.0773,
+            1.0805,
+            1.1042,
+            1.0077,
+            1.0202
+          ]
+        }
+      },
+      "rss_before_build_mb": 33.83,
+      "stats": {
+        "n_vars": 2525,
+        "n_constraints": 2625,
+        "nnz": 10025
+      },
+      "total_median_ms": 51.2393,
+      "total_complete": true,
+      "stage_order": [
+        "build",
+        "extract"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 141.58
+    },
+    {
+      "backend": "arraynative_highs",
+      "model": "network_flow",
+      "size": "xs",
+      "params": {
+        "N": 8,
+        "T": 6
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "build_matrices": {
+          "name": "build_matrices",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 0.7491479627788067,
+          "median_ms": 0.7692680228501558,
+          "mean_ms": 0.7951479870826006,
+          "stdev_ms": 0.0446948969230098,
+          "samples_ms": [
+            0.8694,
+            0.8229,
+            0.7649,
+            0.7693,
+            0.7491
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 0.5285890074446797,
+          "median_ms": 0.5469688912853599,
+          "mean_ms": 0.542752289523681,
+          "stdev_ms": 0.010284531086393144,
+          "samples_ms": [
+            0.5527,
+            0.547,
+            0.5286
+          ]
+        }
+      },
+      "rss_before_build_mb": 47.53,
+      "stats": {
+        "n_vars": 384,
+        "n_constraints": 48,
+        "nnz": 760
+      },
+      "total_median_ms": 1.3162,
+      "total_complete": true,
+      "stage_order": [
+        "build_matrices",
+        "load_highs"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 127.88
+    },
+    {
+      "backend": "arraynative_highs",
+      "model": "network_flow",
+      "size": "1e4",
+      "params": {
+        "N": 10,
+        "T": 50
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "build_matrices": {
+          "name": "build_matrices",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 1.6484870575368404,
+          "median_ms": 1.7724760109558702,
+          "mean_ms": 1.7576502170413733,
+          "stdev_ms": 0.056203860195834024,
+          "samples_ms": [
+            1.8057,
+            1.7925,
+            1.6485,
+            1.769,
+            1.7725
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1.891326974146068,
+          "median_ms": 1.9025360234081745,
+          "mean_ms": 1.9001396916185815,
+          "stdev_ms": 0.006444025670550648,
+          "samples_ms": [
+            1.9025,
+            1.8913,
+            1.9066
+          ]
+        }
+      },
+      "rss_before_build_mb": 47.85,
+      "stats": {
+        "n_vars": 5000,
+        "n_constraints": 500,
+        "nnz": 9990
+      },
+      "total_median_ms": 3.675,
+      "total_complete": true,
+      "stage_order": [
+        "build_matrices",
+        "load_highs"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 127.56
+    },
+    {
+      "backend": "arraynative_highs",
+      "model": "facility_location",
+      "size": "xs",
+      "params": {
+        "F": 10,
+        "C": 25
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "build_matrices": {
+          "name": "build_matrices",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 0.3733589546754956,
+          "median_ms": 0.39164896588772535,
+          "mean_ms": 0.3971490077674389,
+          "stdev_ms": 0.02104623745860649,
+          "samples_ms": [
+            0.4332,
+            0.406,
+            0.3734,
+            0.3916,
+            0.3816
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 0.5892390618100762,
+          "median_ms": 0.6000089924782515,
+          "mean_ms": 0.6098956800997257,
+          "stdev_ms": 0.02204038722640312,
+          "samples_ms": [
+            0.6404,
+            0.6,
+            0.5892
+          ]
+        }
+      },
+      "rss_before_build_mb": 47.73,
+      "stats": {
+        "n_vars": 260,
+        "n_constraints": 285,
+        "nnz": 1010
+      },
+      "total_median_ms": 0.9917,
+      "total_complete": true,
+      "stage_order": [
+        "build_matrices",
+        "load_highs"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 127.68
+    },
+    {
+      "backend": "arraynative_highs",
+      "model": "facility_location",
+      "size": "1e4",
+      "params": {
+        "F": 25,
+        "C": 100
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "build_matrices": {
+          "name": "build_matrices",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 0.9337080409750342,
+          "median_ms": 0.9461879963055253,
+          "mean_ms": 0.9812358068302274,
+          "stdev_ms": 0.0770268875135734,
+          "samples_ms": [
+            1.135,
+            0.9462,
+            0.9446,
+            0.9467,
+            0.9337
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 2.5009450037032366,
+          "median_ms": 2.5278539396822453,
+          "mean_ms": 2.545197649548451,
+          "stdev_ms": 0.04491923111969207,
+          "samples_ms": [
+            2.5009,
+            2.5279,
+            2.6068
+          ]
+        }
+      },
+      "rss_before_build_mb": 47.77,
+      "stats": {
+        "n_vars": 2525,
+        "n_constraints": 2625,
+        "nnz": 10025
+      },
+      "total_median_ms": 3.474,
+      "total_complete": true,
+      "stage_order": [
+        "build_matrices",
+        "load_highs"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 127.64
+    },
+    {
+      "backend": "arraynative_gurobi",
+      "model": "network_flow",
+      "size": "xs",
+      "params": {
+        "N": 8,
+        "T": 6
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "build_matrices": {
+          "name": "build_matrices",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 0.8646179921925068,
+          "median_ms": 0.8987290784716606,
+          "mean_ms": 0.8942322339862585,
+          "stdev_ms": 0.02126682783253186,
+          "samples_ms": [
+            0.9205,
+            0.912,
+            0.8987,
+            0.8646,
+            0.8753
+          ]
+        },
+        "load_gurobi": {
+          "name": "load_gurobi",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 0.7678980473428965,
+          "median_ms": 0.7706190226599574,
+          "mean_ms": 0.7712150303026041,
+          "stdev_ms": 0.002981559799791377,
+          "samples_ms": [
+            0.7751,
+            0.7679,
+            0.7706
+          ]
+        }
+      },
+      "rss_before_build_mb": 47.58,
+      "stats": {
+        "n_vars": 384,
+        "n_constraints": 48,
+        "nnz": 760
+      },
+      "total_median_ms": 1.6693,
+      "total_complete": true,
+      "stage_order": [
+        "build_matrices",
+        "load_gurobi"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 127.83
+    },
+    {
+      "backend": "arraynative_gurobi",
+      "model": "facility_location",
+      "size": "xs",
+      "params": {
+        "F": 10,
+        "C": 25
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "build_matrices": {
+          "name": "build_matrices",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 0.40001992601901293,
+          "median_ms": 0.41151896584779024,
+          "mean_ms": 0.4801249597221613,
+          "stdev_ms": 0.13915211921401777,
+          "samples_ms": [
+            0.7577,
+            0.4115,
+            0.4288,
+            0.4026,
+            0.4
+          ]
+        },
+        "load_gurobi": {
+          "name": "load_gurobi",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 0.9706179844215512,
+          "median_ms": 0.9850480128079653,
+          "mean_ms": 1.0201076899344723,
+          "stdev_ms": 0.06007498097288911,
+          "samples_ms": [
+            1.1047,
+            0.985,
+            0.9706
+          ]
+        }
+      },
+      "rss_before_build_mb": 47.55,
+      "stats": {
+        "n_vars": 260,
+        "n_constraints": 285,
+        "nnz": 1010
+      },
+      "total_median_ms": 1.3966,
+      "total_complete": true,
+      "stage_order": [
+        "build_matrices",
+        "load_gurobi"
+      ],
+      "peak_rss_mb": 175.41,
+      "model_rss_mb": 127.86
+    }
+  ],
+  "complete": true,
+  "equivalence": {
+    "oracle": "standard_form_equivalence",
+    "results": [
+      {
+        "size": "xs",
+        "model": "facility_location",
+        "params": {
+          "F": 10,
+          "C": 25
+        },
+        "n_vars": 260,
+        "nnz_pyomo": 1010,
+        "nnz_array": 1010,
+        "checks": {
+          "var_names_equal": true,
+          "bounds_equal": true,
+          "nnz_equal": true,
+          "row_degree_multiset_equal": true,
+          "col_degree_multiset_equal": true,
+          "objective_equal": true,
+          "constraint_rows_equal_up_to_permutation": true
+        },
+        "equivalent": true,
+        "obj_pyomo": 469.35,
+        "obj_array": 469.35,
+        "obj_equal": true
+      },
+      {
+        "size": "1e4",
+        "model": "facility_location",
+        "params": {
+          "F": 25,
+          "C": 100
+        },
+        "n_vars": 2525,
+        "nnz_pyomo": 10025,
+        "nnz_array": 10025,
+        "checks": {
+          "var_names_equal": true,
+          "bounds_equal": true,
+          "nnz_equal": true,
+          "row_degree_multiset_equal": true,
+          "col_degree_multiset_equal": true,
+          "objective_equal": true,
+          "constraint_rows_equal_up_to_permutation": true
+        },
+        "equivalent": true,
+        "obj_pyomo": 1165.8,
+        "obj_array": 1165.8,
+        "obj_equal": true
+      },
+      {
+        "size": "xs",
+        "model": "network_flow",
+        "params": {
+          "N": 8,
+          "T": 6
+        },
+        "n_vars": 384,
+        "nnz_pyomo": 760,
+        "nnz_array": 760,
+        "checks": {
+          "var_names_equal": true,
+          "bounds_equal": true,
+          "nnz_equal": true,
+          "row_degree_multiset_equal": true,
+          "col_degree_multiset_equal": true,
+          "objective_equal": true,
+          "constraint_rows_equal_up_to_permutation": true
+        },
+        "equivalent": true,
+        "obj_pyomo": 128.784289,
+        "obj_array": 128.784289,
+        "obj_equal": true
+      },
+      {
+        "size": "1e4",
+        "model": "network_flow",
+        "params": {
+          "N": 10,
+          "T": 50
+        },
+        "n_vars": 5000,
+        "nnz_pyomo": 9990,
+        "nnz_array": 9990,
+        "checks": {
+          "var_names_equal": true,
+          "bounds_equal": true,
+          "nnz_equal": true,
+          "row_degree_multiset_equal": true,
+          "col_degree_multiset_equal": true,
+          "objective_equal": true,
+          "constraint_rows_equal_up_to_permutation": true
+        },
+        "equivalent": true,
+        "obj_pyomo": 1452.163949,
+        "obj_array": 1452.163949,
+        "obj_equal": true
+      }
+    ],
+    "all_equivalent": true
+  }
+}

@@ -1,0 +1,102 @@
+{
+  "oracle": "standard_form_equivalence",
+  "results": [
+    {
+      "size": "xs",
+      "model": "facility_location",
+      "params": {
+        "F": 10,
+        "C": 25
+      },
+      "n_vars": 260,
+      "nnz_pyomo": 1010,
+      "nnz_array": 1010,
+      "checks": {
+        "var_names_equal": true,
+        "bounds_equal": true,
+        "nnz_equal": true,
+        "row_degree_multiset_equal": true,
+        "col_degree_multiset_equal": true,
+        "objective_equal": true,
+        "constraint_rows_equal_up_to_permutation": true
+      },
+      "equivalent": true,
+      "obj_pyomo": 469.35,
+      "obj_array": 469.35,
+      "obj_equal": true
+    },
+    {
+      "size": "1e4",
+      "model": "facility_location",
+      "params": {
+        "F": 25,
+        "C": 100
+      },
+      "n_vars": 2525,
+      "nnz_pyomo": 10025,
+      "nnz_array": 10025,
+      "checks": {
+        "var_names_equal": true,
+        "bounds_equal": true,
+        "nnz_equal": true,
+        "row_degree_multiset_equal": true,
+        "col_degree_multiset_equal": true,
+        "objective_equal": true,
+        "constraint_rows_equal_up_to_permutation": true
+      },
+      "equivalent": true,
+      "obj_pyomo": 1165.8,
+      "obj_array": 1165.8,
+      "obj_equal": true
+    },
+    {
+      "size": "xs",
+      "model": "network_flow",
+      "params": {
+        "N": 8,
+        "T": 6
+      },
+      "n_vars": 384,
+      "nnz_pyomo": 760,
+      "nnz_array": 760,
+      "checks": {
+        "var_names_equal": true,
+        "bounds_equal": true,
+        "nnz_equal": true,
+        "row_degree_multiset_equal": true,
+        "col_degree_multiset_equal": true,
+        "objective_equal": true,
+        "constraint_rows_equal_up_to_permutation": true
+      },
+      "equivalent": true,
+      "obj_pyomo": 128.784289,
+      "obj_array": 128.784289,
+      "obj_equal": true
+    },
+    {
+      "size": "1e4",
+      "model": "network_flow",
+      "params": {
+        "N": 10,
+        "T": 50
+      },
+      "n_vars": 5000,
+      "nnz_pyomo": 9990,
+      "nnz_array": 9990,
+      "checks": {
+        "var_names_equal": true,
+        "bounds_equal": true,
+        "nnz_equal": true,
+        "row_degree_multiset_equal": true,
+        "col_degree_multiset_equal": true,
+        "objective_equal": true,
+        "constraint_rows_equal_up_to_permutation": true
+      },
+      "equivalent": true,
+      "obj_pyomo": 1452.163949,
+      "obj_array": 1452.163949,
+      "obj_equal": true
+    }
+  ],
+  "all_equivalent": true
+}

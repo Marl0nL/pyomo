@@ -1,0 +1,7 @@
+# The benchmark virtualenv is machine-local and large; recreate it with the
+# steps in README.md. Never commit it.
+.venv/
+
+# Byte-compiled / cache
+__pycache__/
+*.pyc

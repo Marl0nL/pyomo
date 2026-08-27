@@ -1,0 +1,68 @@
+{
+  "spike": "A_columnar_var",
+  "rows": [
+    {
+      "N": 10000,
+      "classic": {
+        "N": 10000,
+        "construct_s": 0.004199352930299938,
+        "bytes": 1733248,
+        "bytes_per_var": 173.3248,
+        "vars_per_s": 2381319.2570327143,
+        "access_s_per_100k": 0.023248560028150678
+      },
+      "columnar": {
+        "N": 10000,
+        "construct_s": 1.1709984391927719e-05,
+        "bytes": 260000,
+        "bytes_per_var": 26.0,
+        "vars_per_s": 853972103.23299,
+        "access_s_per_100k": 0.0006092991679906845
+      },
+      "speedup_construct": 358.61302541058575,
+      "memory_ratio_columnar_over_classic": 0.1500073849789528
+    },
+    {
+      "N": 100000,
+      "classic": {
+        "N": 100000,
+        "construct_s": 0.06444441806524992,
+        "bytes": 19639384,
+        "bytes_per_var": 196.39384,
+        "vars_per_s": 1551724.7731021496,
+        "access_s_per_100k": 0.030352562083862722
+      },
+      "columnar": {
+        "N": 100000,
+        "construct_s": 0.00012131896801292896,
+        "bytes": 2600000,
+        "bytes_per_var": 26.0,
+        "vars_per_s": 824273414.4370812,
+        "access_s_per_100k": 0.00023955001961439848
+      },
+      "speedup_construct": 531.1982052005427,
+      "memory_ratio_columnar_over_classic": 0.13238704431870166
+    },
+    {
+      "N": 1000000,
+      "classic": {
+        "N": 1000000,
+        "construct_s": 0.8547098640119657,
+        "bytes": 185939456,
+        "bytes_per_var": 185.939456,
+        "vars_per_s": 1169987.6672840181,
+        "access_s_per_100k": 0.04389386996626854
+      },
+      "columnar": {
+        "N": 1000000,
+        "construct_s": 0.0015782970003783703,
+        "bytes": 26000000,
+        "bytes_per_var": 26.0,
+        "vars_per_s": 633594310.6780705,
+        "access_s_per_100k": 0.0007176890503615141
+      },
+      "speedup_construct": 541.5393071184088,
+      "memory_ratio_columnar_over_classic": 0.1398304618036529
+    }
+  ]
+}
