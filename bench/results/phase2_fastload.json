@@ -1,0 +1,1435 @@
+{
+  "sysinfo": {
+    "python": "3.12.13",
+    "platform": "Linux-6.17.7-ba29.fc43.x86_64-x86_64-with-glibc2.42",
+    "machine": "x86_64",
+    "processor": "x86_64",
+    "cpu_count": 12,
+    "pyomo_repo": "/var/home/marlon/.treehouse/pyomo-808831/3/pyomo",
+    "pyomo_commit": "cb9f7c11410a3afaec303056b8ff2c0dc4f03d3e",
+    "packages": {
+      "Pyomo": "6.10.2.dev0",
+      "numpy": "2.5.2",
+      "scipy": "1.18.1",
+      "highspy": "1.15.1",
+      "gurobipy": null,
+      "linopy": "0.9.1",
+      "xarray": "2026.7.0",
+      "pandas": "3.0.5"
+    },
+    "pyomo_file": "/var/home/marlon/.treehouse/pyomo-808831/3/pyomo/pyomo/__init__.py"
+  },
+  "suite": "full",
+  "config": {
+    "backends": [
+      "pyomo"
+    ],
+    "models": [
+      "network_flow",
+      "unit_commitment",
+      "facility_location",
+      "supply_chain"
+    ],
+    "sizes": [
+      "1e4",
+      "1e5",
+      "1e6"
+    ],
+    "repeats": 5,
+    "warmup": 1
+  },
+  "results": [
+    {
+      "backend": "pyomo",
+      "model": "network_flow",
+      "size": "1e4",
+      "params": {
+        "N": 10,
+        "T": 50
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 14.53293499071151,
+          "median_ms": 14.666264993138611,
+          "mean_ms": 14.947828790172935,
+          "stdev_ms": 0.6212505509411403,
+          "samples_ms": [
+            16.1717,
+            14.6663,
+            14.828,
+            14.5329,
+            14.5403
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 11.99781009927392,
+          "median_ms": 12.252979911863804,
+          "mean_ms": 12.282247608527541,
+          "stdev_ms": 0.2561953350545695,
+          "samples_ms": [
+            11.9978,
+            12.5324,
+            12.0125,
+            12.6155,
+            12.253
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 24.628258892334998,
+          "median_ms": 24.855987983755767,
+          "mean_ms": 24.927719752304256,
+          "stdev_ms": 0.26885610346589883,
+          "samples_ms": [
+            24.6283,
+            24.7652,
+            24.856,
+            24.9735,
+            25.4157
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 54.761036997660995,
+          "median_ms": 56.804404011927545,
+          "mean_ms": 56.5233010177811,
+          "stdev_ms": 1.3389587191534704,
+          "samples_ms": [
+            54.761,
+            56.8044,
+            58.0045
+          ]
+        },
+        "fastload_highs": {
+          "name": "fastload_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 17.721000011079013,
+          "median_ms": 17.958309967070818,
+          "mean_ms": 17.991616351840396,
+          "stdev_ms": 0.23573399008746346,
+          "samples_ms": [
+            17.9583,
+            17.721,
+            18.2955
+          ]
+        }
+      },
+      "rss_before_build_mb": 39.86,
+      "stats": {
+        "n_vars": 5000,
+        "n_binary": 0,
+        "n_integer": 0,
+        "n_constraints": 500,
+        "nnz": 9990
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 266967,
+      "validation": {
+        "termination": "TerminationCondition.optimal",
+        "objective": 1452.1639490585421,
+        "fastload_termination": "TerminationCondition.convergenceCriteriaSatisfied",
+        "fastload_objective": 1452.1639490585426,
+        "objective_match": true,
+        "termination_match": true
+      },
+      "total_median_ms": 108.5796,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "classic_build_to_solver_ms": 71.4707,
+      "fast_build_to_solver_ms": 32.6246,
+      "fastload_speedup": 2.191,
+      "peak_rss_mb": 154.93,
+      "model_rss_mb": 115.07
+    },
+    {
+      "backend": "pyomo",
+      "model": "network_flow",
+      "size": "1e5",
+      "params": {
+        "N": 20,
+        "T": 125
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 142.27928896434605,
+          "median_ms": 145.35141503438354,
+          "mean_ms": 148.7833187682554,
+          "stdev_ms": 5.888486811632431,
+          "samples_ms": [
+            157.0348,
+            154.6148,
+            145.3514,
+            142.2793,
+            144.6363
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 113.85554797016084,
+          "median_ms": 116.13254400435835,
+          "mean_ms": 122.2894836217165,
+          "stdev_ms": 8.799084828121913,
+          "samples_ms": [
+            113.8555,
+            115.9114,
+            116.1325,
+            129.8115,
+            135.7364
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 245.90291397180408,
+          "median_ms": 252.3677540011704,
+          "mean_ms": 257.3856753995642,
+          "stdev_ms": 9.780020489315106,
+          "samples_ms": [
+            252.3678,
+            251.0214,
+            245.9029,
+            265.7115,
+            271.9248
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 513.3276130072773,
+          "median_ms": 515.5959189869463,
+          "mean_ms": 516.8018440017477,
+          "stdev_ms": 3.436490283966325,
+          "samples_ms": [
+            521.482,
+            515.5959,
+            513.3276
+          ]
+        },
+        "fastload_highs": {
+          "name": "fastload_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 165.62133992556483,
+          "median_ms": 167.36673808190972,
+          "mean_ms": 169.4282206784313,
+          "stdev_ms": 4.210294525040077,
+          "samples_ms": [
+            165.6213,
+            167.3667,
+            175.2966
+          ]
+        }
+      },
+      "rss_before_build_mb": 39.94,
+      "stats": {
+        "n_vars": 50000,
+        "n_binary": 0,
+        "n_integer": 0,
+        "n_constraints": 2500,
+        "nnz": 99980
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 2827535,
+      "total_median_ms": 1029.4476,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "classic_build_to_solver_ms": 660.9473,
+      "fast_build_to_solver_ms": 312.7182,
+      "fastload_speedup": 2.114,
+      "peak_rss_mb": 264.49,
+      "model_rss_mb": 224.55
+    },
+    {
+      "backend": "pyomo",
+      "model": "network_flow",
+      "size": "1e6",
+      "params": {
+        "N": 50,
+        "T": 200
+      },
+      "repeats": 3,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1520.8660219796002,
+          "median_ms": 1552.3113689851016,
+          "mean_ms": 1545.7307366499056,
+          "stdev_ms": 18.219645298448167,
+          "samples_ms": [
+            1520.866,
+            1564.0148,
+            1552.3114
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1409.0111510595307,
+          "median_ms": 1431.3394631026313,
+          "mean_ms": 1424.676548068722,
+          "stdev_ms": 11.118210016604259,
+          "samples_ms": [
+            1409.0112,
+            1433.679,
+            1431.3395
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 2973.170420038514,
+          "median_ms": 3002.6491900207475,
+          "mean_ms": 2999.6954353603846,
+          "stdev_ms": 20.55809194771268,
+          "samples_ms": [
+            2973.1704,
+            3002.6492,
+            3023.2667
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 5589.935022057034,
+          "median_ms": 5611.864864011295,
+          "mean_ms": 5670.887301365535,
+          "stdev_ms": 99.38115337978797,
+          "samples_ms": [
+            5589.935,
+            5810.862,
+            5611.8649
+          ]
+        },
+        "fastload_highs": {
+          "name": "fastload_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1753.3879899419844,
+          "median_ms": 1772.633527056314,
+          "mean_ms": 1767.3335393580298,
+          "stdev_ms": 9.955131935053114,
+          "samples_ms": [
+            1753.388,
+            1772.6335,
+            1775.9791
+          ]
+        }
+      },
+      "rss_before_build_mb": 39.79,
+      "stats": {
+        "n_vars": 500000,
+        "n_binary": 0,
+        "n_integer": 0,
+        "n_constraints": 10000,
+        "nnz": 999950
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 29733367,
+      "total_median_ms": 11598.1649,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "classic_build_to_solver_ms": 7164.1762,
+      "fast_build_to_solver_ms": 3324.9449,
+      "fastload_speedup": 2.155,
+      "peak_rss_mb": 1281.21,
+      "model_rss_mb": 1241.42
+    },
+    {
+      "backend": "pyomo",
+      "model": "unit_commitment",
+      "size": "1e4",
+      "params": {
+        "G": 20,
+        "T": 40,
+        "min_up": 3
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 12.003679061308503,
+          "median_ms": 12.159170000813901,
+          "mean_ms": 12.492591002956033,
+          "stdev_ms": 0.6130765463337423,
+          "samples_ms": [
+            13.6715,
+            12.5087,
+            12.1198,
+            12.0037,
+            12.1592
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 17.818280030041933,
+          "median_ms": 18.25647905934602,
+          "mean_ms": 18.481434625573456,
+          "stdev_ms": 0.5976810297376917,
+          "samples_ms": [
+            17.8183,
+            19.5835,
+            18.2565,
+            18.5451,
+            18.2038
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 30.412378953769803,
+          "median_ms": 30.602518003433943,
+          "mean_ms": 30.628196196630597,
+          "stdev_ms": 0.19153930609596645,
+          "samples_ms": [
+            30.8407,
+            30.8555,
+            30.4124,
+            30.6025,
+            30.4298
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 133.5070040076971,
+          "median_ms": 134.71908192150295,
+          "mean_ms": 135.969839990139,
+          "stdev_ms": 2.6721238493546915,
+          "samples_ms": [
+            134.7191,
+            139.6834,
+            133.507
+          ]
+        },
+        "fastload_highs": {
+          "name": "fastload_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 20.89861501008272,
+          "median_ms": 20.984575035981834,
+          "mean_ms": 21.096107666380703,
+          "stdev_ms": 0.2213138832468452,
+          "samples_ms": [
+            20.9846,
+            20.8986,
+            21.4051
+          ]
+        }
+      },
+      "rss_before_build_mb": 40.35,
+      "stats": {
+        "n_vars": 2400,
+        "n_binary": 800,
+        "n_integer": 0,
+        "n_constraints": 4740,
+        "nnz": 12500
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 273162,
+      "validation": {
+        "termination": "TerminationCondition.optimal",
+        "objective": 857121.0882803225,
+        "fastload_termination": "TerminationCondition.convergenceCriteriaSatisfied",
+        "fastload_objective": 857121.0882803225,
+        "objective_match": true,
+        "termination_match": true
+      },
+      "total_median_ms": 195.7372,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "classic_build_to_solver_ms": 146.8783,
+      "fast_build_to_solver_ms": 33.1437,
+      "fastload_speedup": 4.432,
+      "peak_rss_mb": 173.01,
+      "model_rss_mb": 132.66
+    },
+    {
+      "backend": "pyomo",
+      "model": "unit_commitment",
+      "size": "1e5",
+      "params": {
+        "G": 50,
+        "T": 160,
+        "min_up": 3
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 126.01955700665712,
+          "median_ms": 129.62253100704402,
+          "mean_ms": 129.53712900634855,
+          "stdev_ms": 2.7335345944631775,
+          "samples_ms": [
+            133.669,
+            127.2298,
+            131.1448,
+            126.0196,
+            129.6225
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 193.2341440115124,
+          "median_ms": 195.43653004802763,
+          "mean_ms": 196.03805299848318,
+          "stdev_ms": 2.0960589054676624,
+          "samples_ms": [
+            193.2341,
+            195.4365,
+            195.3576,
+            196.5104,
+            199.6516
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 322.5212449906394,
+          "median_ms": 327.016967930831,
+          "mean_ms": 337.4787719687447,
+          "stdev_ms": 17.537267746276545,
+          "samples_ms": [
+            327.017,
+            326.0271,
+            322.5212,
+            369.9451,
+            341.8835
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1387.1258579893038,
+          "median_ms": 1393.337757093832,
+          "mean_ms": 1393.6543833697215,
+          "stdev_ms": 5.464369345715573,
+          "samples_ms": [
+            1400.4995,
+            1393.3378,
+            1387.1259
+          ]
+        },
+        "fastload_highs": {
+          "name": "fastload_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 235.2513229707256,
+          "median_ms": 235.9151019481942,
+          "mean_ms": 236.47631099447608,
+          "stdev_ms": 1.2917754222971458,
+          "samples_ms": [
+            235.2513,
+            235.9151,
+            238.2625
+          ]
+        }
+      },
+      "rss_before_build_mb": 39.8,
+      "stats": {
+        "n_vars": 24000,
+        "n_binary": 8000,
+        "n_integer": 0,
+        "n_constraints": 47910,
+        "nnz": 127250
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 2979488,
+      "total_median_ms": 2045.4138,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "classic_build_to_solver_ms": 1522.9603,
+      "fast_build_to_solver_ms": 365.5376,
+      "fastload_speedup": 4.166,
+      "peak_rss_mb": 274.23,
+      "model_rss_mb": 234.43
+    },
+    {
+      "backend": "pyomo",
+      "model": "unit_commitment",
+      "size": "1e6",
+      "params": {
+        "G": 100,
+        "T": 800,
+        "min_up": 3
+      },
+      "repeats": 3,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1440.7238070853055,
+          "median_ms": 1453.4549560630694,
+          "mean_ms": 1475.4040920330833,
+          "stdev_ms": 40.378946855069714,
+          "samples_ms": [
+            1440.7238,
+            1453.455,
+            1532.0335
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 2230.450683971867,
+          "median_ms": 2329.4665870489553,
+          "mean_ms": 2314.0640530036762,
+          "stdev_ms": 62.93158069264631,
+          "samples_ms": [
+            2230.4507,
+            2382.2749,
+            2329.4666
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 3747.080313041806,
+          "median_ms": 3757.4150960426778,
+          "mean_ms": 3798.384750029072,
+          "stdev_ms": 65.38390644840307,
+          "samples_ms": [
+            3747.0803,
+            3757.4151,
+            3890.6588
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 17150.697662029415,
+          "median_ms": 17223.97963795811,
+          "mean_ms": 17332.41870832474,
+          "stdev_ms": 207.34388822270677,
+          "samples_ms": [
+            17223.9796,
+            17622.5788,
+            17150.6977
+          ]
+        },
+        "fastload_highs": {
+          "name": "fastload_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 2599.2113809334114,
+          "median_ms": 2698.526013060473,
+          "mean_ms": 2670.387310984855,
+          "stdev_ms": 50.695175855405736,
+          "samples_ms": [
+            2599.2114,
+            2698.526,
+            2713.4245
+          ]
+        }
+      },
+      "rss_before_build_mb": 40.0,
+      "stats": {
+        "n_vars": 240000,
+        "n_binary": 80000,
+        "n_integer": 0,
+        "n_constraints": 480300,
+        "nnz": 1278500
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 32101957,
+      "total_median_ms": 24764.3163,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "classic_build_to_solver_ms": 18677.4346,
+      "fast_build_to_solver_ms": 4151.981,
+      "fastload_speedup": 4.498,
+      "peak_rss_mb": 1528.54,
+      "model_rss_mb": 1488.54
+    },
+    {
+      "backend": "pyomo",
+      "model": "facility_location",
+      "size": "1e4",
+      "params": {
+        "F": 25,
+        "C": 100
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 9.799182997085154,
+          "median_ms": 9.859474026598036,
+          "mean_ms": 10.004047024995089,
+          "stdev_ms": 0.24039549053937145,
+          "samples_ms": [
+            10.4364,
+            9.8595,
+            10.0963,
+            9.8289,
+            9.7992
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 12.494419002905488,
+          "median_ms": 12.60929903946817,
+          "mean_ms": 12.766174809075892,
+          "stdev_ms": 0.30824170695908687,
+          "samples_ms": [
+            12.4944,
+            12.5037,
+            12.9261,
+            13.2973,
+            12.6093
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 22.182323038578033,
+          "median_ms": 22.66205195337534,
+          "mean_ms": 22.64222779776901,
+          "stdev_ms": 0.39058805715304096,
+          "samples_ms": [
+            22.3356,
+            22.1823,
+            23.314,
+            22.6621,
+            22.7172
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 56.95315403863788,
+          "median_ms": 57.81869194470346,
+          "mean_ms": 57.55378930674245,
+          "stdev_ms": 0.4256965005857533,
+          "samples_ms": [
+            56.9532,
+            57.8895,
+            57.8187
+          ]
+        },
+        "fastload_highs": {
+          "name": "fastload_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 15.633694012649357,
+          "median_ms": 15.670043067075312,
+          "mean_ms": 15.745880043444535,
+          "stdev_ms": 0.13377793006016336,
+          "samples_ms": [
+            15.9339,
+            15.67,
+            15.6337
+          ]
+        }
+      },
+      "rss_before_build_mb": 39.88,
+      "stats": {
+        "n_vars": 2525,
+        "n_binary": 25,
+        "n_integer": 0,
+        "n_constraints": 2625,
+        "nnz": 10025
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 202446,
+      "validation": {
+        "termination": "TerminationCondition.optimal",
+        "objective": 1165.799999999999,
+        "fastload_termination": "TerminationCondition.convergenceCriteriaSatisfied",
+        "fastload_objective": 1165.7999999999997,
+        "objective_match": true,
+        "termination_match": true
+      },
+      "total_median_ms": 102.9495,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "classic_build_to_solver_ms": 67.6782,
+      "fast_build_to_solver_ms": 25.5295,
+      "fastload_speedup": 2.651,
+      "peak_rss_mb": 178.25,
+      "model_rss_mb": 138.37
+    },
+    {
+      "backend": "pyomo",
+      "model": "facility_location",
+      "size": "1e5",
+      "params": {
+        "F": 50,
+        "C": 500
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 96.43807797692716,
+          "median_ms": 97.75794495362788,
+          "mean_ms": 99.40677059348673,
+          "stdev_ms": 2.91781917864213,
+          "samples_ms": [
+            104.1646,
+            97.2884,
+            101.3848,
+            97.7579,
+            96.4381
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 124.2172799538821,
+          "median_ms": 131.57874799799174,
+          "mean_ms": 133.31920278724283,
+          "stdev_ms": 8.121636219854214,
+          "samples_ms": [
+            131.5787,
+            129.2018,
+            133.2136,
+            124.2173,
+            148.3846
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 230.07275199051946,
+          "median_ms": 231.81657900568098,
+          "mean_ms": 231.79111301433295,
+          "stdev_ms": 1.26859154076815,
+          "samples_ms": [
+            231.2081,
+            231.8166,
+            231.889,
+            233.9691,
+            230.0728
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 583.514034980908,
+          "median_ms": 584.4090429600328,
+          "mean_ms": 585.1094519797092,
+          "stdev_ms": 1.664005739375694,
+          "samples_ms": [
+            583.514,
+            584.409,
+            587.4053
+          ]
+        },
+        "fastload_highs": {
+          "name": "fastload_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 161.54527699109167,
+          "median_ms": 162.65451500657946,
+          "mean_ms": 162.58649869511524,
+          "stdev_ms": 0.8237915577097562,
+          "samples_ms": [
+            161.5453,
+            162.6545,
+            163.5597
+          ]
+        }
+      },
+      "rss_before_build_mb": 40.0,
+      "stats": {
+        "n_vars": 25050,
+        "n_binary": 50,
+        "n_integer": 0,
+        "n_constraints": 25550,
+        "nnz": 100050
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 2154708,
+      "total_median_ms": 1045.5623,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "classic_build_to_solver_ms": 682.167,
+      "fast_build_to_solver_ms": 260.4125,
+      "fastload_speedup": 2.62,
+      "peak_rss_mb": 235.08,
+      "model_rss_mb": 195.08
+    },
+    {
+      "backend": "pyomo",
+      "model": "facility_location",
+      "size": "1e6",
+      "params": {
+        "F": 100,
+        "C": 2500
+      },
+      "repeats": 3,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1044.7326760040596,
+          "median_ms": 1046.1453839670867,
+          "mean_ms": 1048.185456971017,
+          "stdev_ms": 3.9266202181454637,
+          "samples_ms": [
+            1053.6783,
+            1044.7327,
+            1046.1454
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1413.6450530495495,
+          "median_ms": 1419.3170140497386,
+          "mean_ms": 1448.2303350232542,
+          "stdev_ms": 44.95996157755964,
+          "samples_ms": [
+            1511.7289,
+            1413.6451,
+            1419.317
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 2552.6449200697243,
+          "median_ms": 2555.687504936941,
+          "mean_ms": 2637.4274633514383,
+          "stdev_ms": 117.75574156997511,
+          "samples_ms": [
+            2803.95,
+            2552.6449,
+            2555.6875
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 6045.700870919973,
+          "median_ms": 6054.5484070898965,
+          "mean_ms": 6102.5629589955015,
+          "stdev_ms": 74.24689414096146,
+          "samples_ms": [
+            6054.5484,
+            6045.7009,
+            6207.4396
+          ]
+        },
+        "fastload_highs": {
+          "name": "fastload_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1769.486362929456,
+          "median_ms": 1798.7904530018568,
+          "mean_ms": 1809.5229716661077,
+          "stdev_ms": 37.840107879776106,
+          "samples_ms": [
+            1798.7905,
+            1860.2921,
+            1769.4864
+          ]
+        }
+      },
+      "rss_before_build_mb": 39.89,
+      "stats": {
+        "n_vars": 250100,
+        "n_binary": 100,
+        "n_integer": 0,
+        "n_constraints": 252600,
+        "nnz": 1000100
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 22990396,
+      "total_median_ms": 11075.6983,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "classic_build_to_solver_ms": 7100.6938,
+      "fast_build_to_solver_ms": 2844.9358,
+      "fastload_speedup": 2.496,
+      "peak_rss_mb": 1020.21,
+      "model_rss_mb": 980.32
+    },
+    {
+      "backend": "pyomo",
+      "model": "supply_chain",
+      "size": "1e4",
+      "params": {
+        "S": 8,
+        "W": 12,
+        "R": 20,
+        "deg": 3,
+        "T": 40,
+        "seed": 0
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 9.991912986151874,
+          "median_ms": 10.041833040304482,
+          "mean_ms": 10.216622822917998,
+          "stdev_ms": 0.35960434887513354,
+          "samples_ms": [
+            10.9337,
+            10.0356,
+            9.9919,
+            10.0418,
+            10.0801
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 10.360572021454573,
+          "median_ms": 10.419192025437951,
+          "mean_ms": 10.470500192604959,
+          "stdev_ms": 0.1048615220736596,
+          "samples_ms": [
+            10.3606,
+            10.3852,
+            10.4192,
+            10.6298,
+            10.5578
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 19.70912702381611,
+          "median_ms": 19.856457016430795,
+          "mean_ms": 19.820990809239447,
+          "stdev_ms": 0.06325468354050474,
+          "samples_ms": [
+            19.8816,
+            19.8565,
+            19.7091,
+            19.8638,
+            19.794
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 51.1939040152356,
+          "median_ms": 51.530573051422834,
+          "mean_ms": 51.581373011382915,
+          "stdev_ms": 0.33901452122036607,
+          "samples_ms": [
+            51.1939,
+            52.0196,
+            51.5306
+          ]
+        },
+        "fastload_highs": {
+          "name": "fastload_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 13.670696993358433,
+          "median_ms": 13.711926992982626,
+          "mean_ms": 13.804163318127394,
+          "stdev_ms": 0.16048103283734594,
+          "samples_ms": [
+            14.0299,
+            13.6707,
+            13.7119
+          ]
+        }
+      },
+      "rss_before_build_mb": 40.02,
+      "stats": {
+        "n_vars": 3200,
+        "n_binary": 0,
+        "n_integer": 0,
+        "n_constraints": 1600,
+        "nnz": 6388
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 192506,
+      "validation": {
+        "termination": "TerminationCondition.optimal",
+        "objective": 22066.0,
+        "fastload_termination": "TerminationCondition.convergenceCriteriaSatisfied",
+        "fastload_objective": 22066.0,
+        "objective_match": true,
+        "termination_match": true
+      },
+      "total_median_ms": 91.8481,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "classic_build_to_solver_ms": 61.5724,
+      "fast_build_to_solver_ms": 23.7538,
+      "fastload_speedup": 2.592,
+      "peak_rss_mb": 147.64,
+      "model_rss_mb": 107.62
+    },
+    {
+      "backend": "pyomo",
+      "model": "supply_chain",
+      "size": "1e5",
+      "params": {
+        "S": 15,
+        "W": 30,
+        "R": 60,
+        "deg": 4,
+        "T": 120,
+        "seed": 0
+      },
+      "repeats": 5,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 86.12380502745509,
+          "median_ms": 88.033662061207,
+          "mean_ms": 88.5098546044901,
+          "stdev_ms": 2.287601601991903,
+          "samples_ms": [
+            92.7728,
+            88.0337,
+            88.5485,
+            86.1238,
+            87.0705
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 91.13039600197226,
+          "median_ms": 91.90136496908963,
+          "mean_ms": 92.42039995733649,
+          "stdev_ms": 1.1964751880781361,
+          "samples_ms": [
+            93.8942,
+            91.1304,
+            93.8119,
+            91.3641,
+            91.9014
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 5,
+          "warmup": 1,
+          "min_ms": 172.8312789928168,
+          "median_ms": 176.00514297373593,
+          "mean_ms": 175.73360938113183,
+          "stdev_ms": 1.8086442263533566,
+          "samples_ms": [
+            178.4201,
+            176.0051,
+            176.2714,
+            175.1401,
+            172.8313
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 461.22322196606547,
+          "median_ms": 465.379083994776,
+          "mean_ms": 464.4296393186475,
+          "stdev_ms": 2.3292690623330397,
+          "samples_ms": [
+            466.6866,
+            465.3791,
+            461.2232
+          ]
+        },
+        "fastload_highs": {
+          "name": "fastload_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 120.06852799095213,
+          "median_ms": 121.89416401088238,
+          "mean_ms": 121.36632533899198,
+          "stdev_ms": 0.9229893432212685,
+          "samples_ms": [
+            122.1363,
+            121.8942,
+            120.0685
+          ]
+        }
+      },
+      "rss_before_build_mb": 40.02,
+      "stats": {
+        "n_vars": 28680,
+        "n_binary": 0,
+        "n_integer": 0,
+        "n_constraints": 12600,
+        "nnz": 57330
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 1813233,
+      "total_median_ms": 821.3193,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "classic_build_to_solver_ms": 553.4127,
+      "fast_build_to_solver_ms": 209.9278,
+      "fastload_speedup": 2.636,
+      "peak_rss_mb": 212.73,
+      "model_rss_mb": 172.71
+    },
+    {
+      "backend": "pyomo",
+      "model": "supply_chain",
+      "size": "1e6",
+      "params": {
+        "S": 40,
+        "W": 80,
+        "R": 160,
+        "deg": 5,
+        "T": 300,
+        "seed": 0
+      },
+      "repeats": 3,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct": {
+          "name": "construct",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 744.2001639865339,
+          "median_ms": 763.4689310798422,
+          "mean_ms": 759.4694379949942,
+          "stdev_ms": 11.197538952040716,
+          "samples_ms": [
+            744.2002,
+            763.4689,
+            770.7392
+          ]
+        },
+        "repn": {
+          "name": "repn",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 835.9860680066049,
+          "median_ms": 856.2093339860439,
+          "mean_ms": 896.7170063406229,
+          "stdev_ms": 72.06102664795887,
+          "samples_ms": [
+            997.9556,
+            856.2093,
+            835.9861
+          ]
+        },
+        "write_lp": {
+          "name": "write_lp",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1501.5712950844318,
+          "median_ms": 1522.0417100936174,
+          "mean_ms": 1519.913073706751,
+          "stdev_ms": 14.1870588571027,
+          "samples_ms": [
+            1536.1262,
+            1522.0417,
+            1501.5713
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 4177.294956985861,
+          "median_ms": 4193.64727998618,
+          "mean_ms": 4196.437438329061,
+          "stdev_ms": 16.88451222424981,
+          "samples_ms": [
+            4193.6473,
+            4218.3701,
+            4177.295
+          ]
+        },
+        "fastload_highs": {
+          "name": "fastload_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1082.0037930971012,
+          "median_ms": 1088.5202619247139,
+          "mean_ms": 1088.1206626848627,
+          "stdev_ms": 4.839523163056152,
+          "samples_ms": [
+            1093.8379,
+            1088.5203,
+            1082.0038
+          ]
+        }
+      },
+      "rss_before_build_mb": 39.89,
+      "stats": {
+        "n_vars": 229800,
+        "n_binary": 0,
+        "n_integer": 0,
+        "n_constraints": 84000,
+        "nnz": 459520
+      },
+      "repn_kind": "LinearStandardFormCompiler",
+      "lp_bytes": 15080919,
+      "total_median_ms": 7335.3673,
+      "total_complete": true,
+      "stage_order": [
+        "construct",
+        "repn",
+        "write_lp",
+        "load_highs"
+      ],
+      "classic_build_to_solver_ms": 4957.1162,
+      "fast_build_to_solver_ms": 1851.9892,
+      "fastload_speedup": 2.677,
+      "peak_rss_mb": 750.45,
+      "model_rss_mb": 710.56
+    }
+  ],
+  "complete": true
+}

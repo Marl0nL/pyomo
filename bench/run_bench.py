@@ -108,8 +108,14 @@ def _sizes_for(model: str) -> Dict[str, Dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 # Worker: run one case in-process, return a result dict
 # --------------------------------------------------------------------------- #
-def run_pyomo_case(model: str, size: str, params: Dict[str, Any], repeats: int, warmup: int,
-                   validate: bool) -> Dict[str, Any]:
+def run_pyomo_case(
+    model: str,
+    size: str,
+    params: Dict[str, Any],
+    repeats: int,
+    warmup: int,
+    validate: bool,
+) -> Dict[str, Any]:
     import pyomo.environ as pyo  # noqa: F401
     from bench.harness import stages
 
@@ -123,20 +129,30 @@ def run_pyomo_case(model: str, size: str, params: Dict[str, Any], repeats: int, 
 
     # Stage 1: construct (fresh build each iteration).
     con_timing, m = timing.time_construct(
-        "construct", lambda: mod.build_pyomo(build_params), repeats=repeats, warmup=warmup
+        "construct",
+        lambda: mod.build_pyomo(build_params),
+        repeats=repeats,
+        warmup=warmup,
     )
     result["stages"]["construct"] = con_timing.as_dict()
 
     # Structural stats + canonical nnz.
     st = stages.model_stats(m)
-    nnz = stages.constraint_matrix_nnz(m) if not is_quad else stages.constraint_matrix_nnz(m)
+    nnz = (
+        stages.constraint_matrix_nnz(m)
+        if not is_quad
+        else stages.constraint_matrix_nnz(m)
+    )
     st["nnz"] = nnz
     result["stats"] = st
 
     # Stage 2: repn.
     if is_quad:
         result["stages"]["repn"] = timing.time_callable(
-            "repn", lambda: stages.stage_repn_quadratic(m), repeats=repeats, warmup=warmup
+            "repn",
+            lambda: stages.stage_repn_quadratic(m),
+            repeats=repeats,
+            warmup=warmup,
         ).as_dict()
         result["repn_kind"] = "generate_standard_repn(quadratic=True)"
     else:
@@ -173,26 +189,120 @@ def run_pyomo_case(model: str, size: str, params: Dict[str, Any], repeats: int, 
     except Exception as e:
         result["stages"]["load_highs"] = {"error": f"{type(e).__name__}: {e}"}
 
-    # Optional correctness validation (small sizes only): solve and record obj.
-    if validate:
+    # Stage 4 (fast route): transparent standard-form compile -> passModel.  The
+    # endpoint is identical to load_highs ("the solver has the model"), so
+    # construct+fastload_highs is the fast-route coherent total to compare
+    # against the classic construct+load_highs.  Requires no model change.
+    if not is_quad:
+
+        def _fastload():
+            return stages.stage_fastload_highs(m)
+
         try:
-            res = stages.solve_highs(m)
-            tc = str(getattr(res, "termination_condition", "n/a"))
-            obj = None
-            try:
-                obj = float(pyo.value(m.obj))
-            except Exception:
-                pass
-            result["validation"] = {"termination": tc, "objective": obj}
+            result["stages"]["fastload_highs"] = timing.time_callable(
+                "fastload_highs", _fastload, repeats=max(3, repeats // 2), warmup=warmup
+            ).as_dict()
         except Exception as e:
-            result["validation"] = {"error": f"{type(e).__name__}: {e}"}
+            result["stages"]["fastload_highs"] = {"error": f"{type(e).__name__}: {e}"}
+
+    # Optional correctness validation (small sizes only): solve the classic
+    # route (APPSI) and the fast route (highs_fastload) and record that their
+    # objectives + termination agree (the Phase-2 solve-equivalence gate).
+    if validate:
+        result["validation"] = _validate_fastload(m, is_quad)
 
     _finalize_total(result, ["construct", "repn", "write_lp", "load_highs"])
+
+    # Derived coherent-route totals ("empty model -> the solver has it").  Both
+    # routes share the same construct; the classic route then does the per-row
+    # APPSI load, the fast route the standard-form compile + passModel hand-off.
+    cons = result["stages"].get("construct", {}).get("median_ms")
+    load = result["stages"].get("load_highs", {})
+    fast = result["stages"].get("fastload_highs", {})
+    load = load.get("median_ms") if isinstance(load, dict) else None
+    fast = fast.get("median_ms") if isinstance(fast, dict) else None
+    if cons is not None and load is not None:
+        result["classic_build_to_solver_ms"] = round(cons + load, 4)
+    if cons is not None and fast is not None:
+        result["fast_build_to_solver_ms"] = round(cons + fast, 4)
+    if result.get("classic_build_to_solver_ms") and result.get(
+        "fast_build_to_solver_ms"
+    ):
+        result["fastload_speedup"] = round(
+            result["classic_build_to_solver_ms"] / result["fast_build_to_solver_ms"], 3
+        )
     return result
 
 
-def run_pyomo_vector_case(model: str, size: str, params: Dict[str, Any],
-                          repeats: int, warmup: int, validate: bool) -> Dict[str, Any]:
+def _active_obj_value(model):
+    """Value of the (first) active objective, or None if it can't be read."""
+    import pyomo.environ as pyo
+
+    for o in model.component_data_objects(pyo.Objective, active=True):
+        try:
+            return float(pyo.value(o))
+        except Exception:
+            return None
+    return None
+
+
+def _validate_fastload(m, is_quad: bool) -> Dict[str, Any]:
+    """Solve a pristine clone of ``m`` the classic (APPSI HiGHS) and fast
+    (highs_fastload) ways and record objective + termination agreement (the
+    Phase-2 solve-equivalence gate).  Each route gets its own clone so neither is
+    affected by state the timed stages left on ``m``.  The quadratic variant is
+    skipped (the linear fast route rejects it by design)."""
+    from bench.harness import stages
+
+    out: Dict[str, Any] = {}
+    # Classic route on a clean clone.
+    try:
+        mc = m.clone()
+        res = stages.solve_highs(mc)
+        out["termination"] = str(getattr(res, "termination_condition", "n/a"))
+        out["objective"] = _active_obj_value(mc)
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
+
+    if is_quad:
+        out["fastload_skipped"] = "quadratic (linear fast route rejects by design)"
+        return out
+
+    # Fast route on its own clean clone.
+    try:
+        from pyomo.contrib.solver.common.factory import SolverFactory
+        from pyomo.contrib.solver.common.results import TerminationCondition
+
+        mf = m.clone()
+        r = SolverFactory('highs_fastload').solve(
+            mf, raise_exception_on_nonoptimal_result=False
+        )
+        out["fastload_termination"] = str(r.termination_condition)
+        out["fastload_objective"] = (
+            None if r.incumbent_objective is None else float(r.incumbent_objective)
+        )
+        oc = out.get("objective")
+        if oc is not None and out["fastload_objective"] is not None:
+            out["objective_match"] = bool(
+                abs(out["fastload_objective"] - oc) <= 1e-5 * max(1.0, abs(oc))
+            )
+        out["termination_match"] = bool(
+            r.termination_condition == TerminationCondition.convergenceCriteriaSatisfied
+        )
+    except Exception as e:
+        out["fastload_error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def run_pyomo_vector_case(
+    model: str,
+    size: str,
+    params: Dict[str, Any],
+    repeats: int,
+    warmup: int,
+    validate: bool,
+) -> Dict[str, Any]:
     """Fast-path (pyomo.contrib.vector) pipeline: construct -> assemble -> passModel.
 
     Stages mirror the classic ``pyomo`` backend so the results tables line up:
@@ -218,8 +328,10 @@ def run_pyomo_vector_case(model: str, size: str, params: Dict[str, Any],
 
     # Stage 1: construct (fresh vector model each iteration).
     con_timing, m = timing.time_construct(
-        "construct", lambda: network_flow_vector.build_pyomo(params),
-        repeats=repeats, warmup=warmup,
+        "construct",
+        lambda: network_flow_vector.build_pyomo(params),
+        repeats=repeats,
+        warmup=warmup,
     )
     result["stages"]["construct"] = con_timing.as_dict()
 
@@ -258,7 +370,9 @@ def run_pyomo_vector_case(model: str, size: str, params: Dict[str, Any],
     return result
 
 
-def _validate_vector(model: str, params: Dict[str, Any], vector_model) -> Dict[str, Any]:
+def _validate_vector(
+    model: str, params: Dict[str, Any], vector_model
+) -> Dict[str, Any]:
     """Check the fast path against the classic path at a small size.
 
     Three independent gates:
@@ -284,9 +398,9 @@ def _validate_vector(model: str, params: Dict[str, Any], vector_model) -> Dict[s
         classic = classic_nf.build_pyomo(params)
         iv = compile_standard_form(vector_model, mixed_form=True)
         ic = LinearStandardFormCompiler().write(classic, mixed_form=True)
-        out["fast_splice_equivalent"] = (
-            canonical_standard_form(iv) == canonical_standard_form(ic)
-        )
+        out["fast_splice_equivalent"] = canonical_standard_form(
+            iv
+        ) == canonical_standard_form(ic)
     except Exception as e:
         out["fast_splice_error"] = f"{type(e).__name__}: {e}"
 
@@ -305,9 +419,12 @@ def _validate_vector(model: str, params: Dict[str, Any], vector_model) -> Dict[s
         out["oracle_obj_equal"] = bool(Pv["obj_terms"] == Av["obj_terms"])
         out["oracle_var_names_equal"] = bool(Pv["var_names"] == Av["var_names"])
         out["oracle_equivalent"] = all(
-            out[k] for k in (
-                "oracle_rows_equal", "oracle_bounds_equal",
-                "oracle_obj_equal", "oracle_var_names_equal",
+            out[k]
+            for k in (
+                "oracle_rows_equal",
+                "oracle_bounds_equal",
+                "oracle_obj_equal",
+                "oracle_var_names_equal",
             )
         )
     except Exception as e:
@@ -338,8 +455,9 @@ def network_flow_vector_build(params):
     return network_flow_vector.build_pyomo(params)
 
 
-def run_linopy_case(model: str, size: str, params: Dict[str, Any], repeats: int,
-                    warmup: int) -> Dict[str, Any]:
+def run_linopy_case(
+    model: str, size: str, params: Dict[str, Any], repeats: int, warmup: int
+) -> Dict[str, Any]:
     from bench.comparators import linopy_impl
 
     if model not in linopy_impl.SUPPORTED:
@@ -360,8 +478,14 @@ def run_linopy_case(model: str, size: str, params: Dict[str, Any], repeats: int,
     return result
 
 
-def run_arraynative_case(model: str, size: str, params: Dict[str, Any], repeats: int,
-                         warmup: int, solver: str) -> Dict[str, Any]:
+def run_arraynative_case(
+    model: str,
+    size: str,
+    params: Dict[str, Any],
+    repeats: int,
+    warmup: int,
+    solver: str,
+) -> Dict[str, Any]:
     from bench.comparators import array_native
 
     if model not in array_native.SUPPORTED:
@@ -471,8 +595,14 @@ def _default_sizes(suite: str) -> List[str]:
     return ["1e4", "1e5", "1e6"]
 
 
-def _plan(suite: str, models: List[str], backends: List[str], sizes: List[str],
-          repeats: int, warmup: int) -> List[Dict[str, Any]]:
+def _plan(
+    suite: str,
+    models: List[str],
+    backends: List[str],
+    sizes: List[str],
+    repeats: int,
+    warmup: int,
+) -> List[Dict[str, Any]]:
     """Build the list of case specs to run."""
     specs: List[Dict[str, Any]] = []
 
@@ -502,46 +632,66 @@ def _plan(suite: str, models: List[str], backends: List[str], sizes: List[str],
                     # Cap it at 1e5 (1e6 quadratic is slow and low-signal).
                     if model == "facility_location_q" and size in ("1e6", "1e7"):
                         continue
-                    specs.append({
-                        "backend": backend, "model": model, "size": size,
-                        "params": dict(model_sizes[size]),
-                        "repeats": repeats_for(size), "warmup": warmup,
-                        "validate": small(size),
-                    })
+                    specs.append(
+                        {
+                            "backend": backend,
+                            "model": model,
+                            "size": size,
+                            "params": dict(model_sizes[size]),
+                            "repeats": repeats_for(size),
+                            "warmup": warmup,
+                            "validate": small(size),
+                        }
+                    )
         elif backend == "pyomo_vector":
             for model in [m for m in models if m in VECTOR_MODEL_NAMES]:
                 model_sizes = _sizes_for(model)
                 for size in sizes:
                     if size not in model_sizes:
                         continue
-                    specs.append({
-                        "backend": backend, "model": model, "size": size,
-                        "params": dict(model_sizes[size]),
-                        "repeats": repeats_for(size), "warmup": warmup,
-                        "validate": small(size),
-                    })
+                    specs.append(
+                        {
+                            "backend": backend,
+                            "model": model,
+                            "size": size,
+                            "params": dict(model_sizes[size]),
+                            "repeats": repeats_for(size),
+                            "warmup": warmup,
+                            "validate": small(size),
+                        }
+                    )
         elif backend in ("linopy", "arraynative_highs"):
             for model in [m for m in models if m in COMPARATOR_MODEL_NAMES]:
                 model_sizes = _sizes_for(model)
                 for size in sizes:
                     if size not in model_sizes:
                         continue
-                    specs.append({
-                        "backend": backend, "model": model, "size": size,
-                        "params": dict(model_sizes[size]),
-                        "repeats": repeats, "warmup": warmup,
-                    })
+                    specs.append(
+                        {
+                            "backend": backend,
+                            "model": model,
+                            "size": size,
+                            "params": dict(model_sizes[size]),
+                            "repeats": repeats,
+                            "warmup": warmup,
+                        }
+                    )
         elif backend == "arraynative_gurobi":
             # Size-limited license: xs only.
             for model in [m for m in models if m in COMPARATOR_MODEL_NAMES]:
                 model_sizes = _sizes_for(model)
                 if "xs" not in model_sizes:
                     continue
-                specs.append({
-                    "backend": backend, "model": model, "size": "xs",
-                    "params": dict(model_sizes["xs"]),
-                    "repeats": repeats, "warmup": warmup,
-                })
+                specs.append(
+                    {
+                        "backend": backend,
+                        "model": model,
+                        "size": "xs",
+                        "params": dict(model_sizes["xs"]),
+                        "repeats": repeats,
+                        "warmup": warmup,
+                    }
+                )
     return specs
 
 
@@ -596,13 +746,19 @@ def _fmt_row(res: Dict[str, Any]) -> str:
         else:
             stage_bits.append(f"{s}=ERR")
     total_s = f"{total:.1f}ms" if total is not None else "n/a"
-    return (f"{tag}  vars={stats.get('n_vars','?')} nnz={nnz} "
-            f"total={total_s} rss={rss}MB | " + " ".join(stage_bits))
+    return (
+        f"{tag}  vars={stats.get('n_vars','?')} nnz={nnz} "
+        f"total={total_s} rss={rss}MB | " + " ".join(stage_bits)
+    )
 
 
 def orchestrate(args) -> int:
-    models = args.models.split(",") if args.models and args.models != "all" else (
-        PYOMO_MODEL_NAMES if not args.comparators_only else COMPARATOR_MODEL_NAMES
+    models = (
+        args.models.split(",")
+        if args.models and args.models != "all"
+        else (
+            PYOMO_MODEL_NAMES if not args.comparators_only else COMPARATOR_MODEL_NAMES
+        )
     )
     if args.backends == "all":
         backends = ALL_BACKENDS
@@ -634,19 +790,31 @@ def orchestrate(args) -> int:
 
             equivalence_report = equivalence.check_all()
             ok = equivalence_report["all_equivalent"]
-            print(f"# equivalence oracle: all_equivalent={ok} "
-                  f"({len(equivalence_report['results'])} cases)", flush=True)
+            print(
+                f"# equivalence oracle: all_equivalent={ok} "
+                f"({len(equivalence_report['results'])} cases)",
+                flush=True,
+            )
         except Exception as e:
-            equivalence_report = {"error": f"{type(e).__name__}: {e}", "all_equivalent": False}
-            print(f"# equivalence oracle FAILED: {equivalence_report['error']}", flush=True)
+            equivalence_report = {
+                "error": f"{type(e).__name__}: {e}",
+                "all_equivalent": False,
+            }
+            print(
+                f"# equivalence oracle FAILED: {equivalence_report['error']}",
+                flush=True,
+            )
 
     def _payload(results):
         p = {
             "sysinfo": info,
             "suite": args.suite,
             "config": {
-                "backends": backends, "models": models, "sizes": sizes,
-                "repeats": args.repeats, "warmup": args.warmup,
+                "backends": backends,
+                "models": models,
+                "sizes": sizes,
+                "repeats": args.repeats,
+                "warmup": args.warmup,
             },
             "results": results,
             "complete": False,
@@ -688,20 +856,34 @@ def orchestrate(args) -> int:
 
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="pyomo-build-bench stage-separated harness")
-    p.add_argument("--single", type=str, default=None,
-                   help="internal worker mode: JSON case spec")
+    p.add_argument(
+        "--single", type=str, default=None, help="internal worker mode: JSON case spec"
+    )
     p.add_argument("--suite", choices=["ci", "full"], default="ci")
-    p.add_argument("--models", type=str, default="all",
-                   help="comma list or 'all' (default: all pyomo models)")
-    p.add_argument("--backends", type=str, default="all",
-                   help=f"comma list or 'all' from {ALL_BACKENDS}")
-    p.add_argument("--sizes", type=str, default=None,
-                   help="comma list of size keys; default depends on --suite")
+    p.add_argument(
+        "--models",
+        type=str,
+        default="all",
+        help="comma list or 'all' (default: all pyomo models)",
+    )
+    p.add_argument(
+        "--backends",
+        type=str,
+        default="all",
+        help=f"comma list or 'all' from {ALL_BACKENDS}",
+    )
+    p.add_argument(
+        "--sizes",
+        type=str,
+        default=None,
+        help="comma list of size keys; default depends on --suite",
+    )
     p.add_argument("--comparators-only", action="store_true")
     p.add_argument("--repeats", type=int, default=5)
     p.add_argument("--warmup", type=int, default=1)
-    p.add_argument("--timeout", type=float, default=1800.0,
-                   help="per-case subprocess timeout (s)")
+    p.add_argument(
+        "--timeout", type=float, default=1800.0, help="per-case subprocess timeout (s)"
+    )
     p.add_argument("--out", type=str, default=None)
     args = p.parse_args(argv)
 

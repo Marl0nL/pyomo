@@ -152,3 +152,29 @@ def solve_highs(model: pyo.ConcreteModel):
     h = Highs()
     res = h.solve(model)
     return res
+
+
+# --------------------------------------------------------------------------- #
+# Stage 4 (fast route): transparent standard-form compile -> HiGHS passModel
+# --------------------------------------------------------------------------- #
+def stage_fastload_highs(model: pyo.ConcreteModel):
+    """Fast-route hand-off: compile an UNMODIFIED classic model to standard form
+    and load it into HiGHS via ``passModel`` (no solve).
+
+    This is the Phase-2 alternative to ``stage_load_highs``: instead of the
+    per-row APPSI ``set_instance`` load (#3888), the classic model is compiled
+    once with ``LinearStandardFormCompiler`` -- the same array the model already
+    produces mid-pipeline -- and handed to HiGHS in one bulk call.  The endpoint
+    ("the solver has the model") is identical to ``stage_load_highs``, so
+    ``construct + fastload_highs`` is directly comparable to the classic coherent
+    ``construct + load_highs`` route.  Requires no change to the model code.
+    """
+    from pyomo.contrib.vector.fastload import compile_to_highs_arrays, build_highs_lp
+    import highspy
+
+    compiled = compile_to_highs_arrays(model)
+    lp = build_highs_lp(compiled)
+    h = highspy.Highs()
+    h.silent()
+    h.passModel(lp)
+    return h

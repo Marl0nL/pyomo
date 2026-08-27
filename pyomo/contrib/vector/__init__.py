@@ -38,6 +38,14 @@ from pyomo.contrib.vector.matrices import (
 )
 from pyomo.contrib.vector.highs import load_highs, solve_highs, matrices_to_highs_lp
 
+# Importing fastload registers the ``highs_fastload`` solver with both the v2
+# and legacy SolverFactory (the transparent classic-model fast hand-off).
+from pyomo.contrib.vector.fastload import (
+    FastLoadHighs,
+    compile_to_highs_arrays,
+    build_highs_lp,
+)
+
 __all__ = [
     'VectorVar',
     'VectorVarData',
@@ -52,4 +60,7 @@ __all__ = [
     'load_highs',
     'solve_highs',
     'matrices_to_highs_lp',
+    'FastLoadHighs',
+    'compile_to_highs_arrays',
+    'build_highs_lp',
 ]

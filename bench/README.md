@@ -102,6 +102,25 @@ bench/.venv/bin/python -m bench.analyze --phase1 bench/results/phase1_network_fl
 ```
 (comma-separated or `all`). gurobipy runs at `xs` only (size-limited license).
 
+### Phase 2 — transparent fast solver hand-off
+
+The `pyomo` backend also measures a `fastload_highs` stage: the Phase-2
+`highs_fastload` solver (`pyomo.contrib.vector.fastload`) compiling an
+**unmodified** classic model to standard form and handing it to HiGHS via
+`passModel` — the endpoint is identical to `load_highs`, so
+`construct + fastload_highs` is the fast-route coherent total to compare against
+the classic `construct + load_highs`.  Each result records the derived
+`classic_build_to_solver_ms` / `fast_build_to_solver_ms` / `fastload_speedup`
+and per-case solve-equivalence in `validation`.  Reproduce the Phase-2 tables
+(see `bench/PHASE2_REPORT.md`):
+
+```bash
+bench/.venv/bin/python -m bench.run_bench --suite full \
+    --models network_flow,unit_commitment,facility_location,supply_chain \
+    --backends pyomo --sizes 1e4,1e5,1e6 --out bench/results/phase2_fastload.json
+bench/.venv/bin/python -m bench.analyze --phase2 bench/results/phase2_fastload.json
+```
+
 ## Notes / caveats
 
 - **Baseline = stock upstream Pyomo at this clone's HEAD** (editable install).
