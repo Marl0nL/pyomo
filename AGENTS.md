@@ -14,7 +14,10 @@ relevant one before touching a phase. Phases: 1 columnar components, 2
 `highs_faststep` (`FastStepHighs`, array-native persistent **warm** re-solve for
 rolling-horizon / MPC). `highs_faststep` accepts mutable constraint-matrix
 coefficients via a value-aware guard (verify the values each roll, not the
-mutability flag) — see `bench/VALUEGUARD_REPORT.md`. CI on the fork is
+mutability flag) — see `bench/VALUEGUARD_REPORT.md` — and engages on models with
+**non-affine** param participation (`price*duration`, `dur/eff`) by **folding**
+the verified-static params as watched constants — see `bench/STATICFOLD_REPORT.md`
+(`FastStepHighs.classification_report()` shows what folded). CI on the fork is
 manual-trigger-only — validate locally.
 
 - Benchmarks run in a machine-local venv `bench/.venv` (recreate per `bench/README.md`);

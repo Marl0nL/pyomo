@@ -167,6 +167,16 @@ def run_size(size: str, dims: Dict[str, Any], rolls: int, seed0: int) -> Dict[st
         guard.changed_mask(cur, vg._matrix_atol, vg._matrix_rtol)
         guard_ticks.append(time.perf_counter() - g0)
 
+    # ----- faststep, verified-static folding leg ---------------------------- #
+    # The model puts a practically-constant mutable `dt` into products
+    # (price*dt in the objective, eff*dt in the matrix) and a reciprocal
+    # (dt/eff), so the coefficients are non-affine in the parameter vector.  The
+    # pre-folding interface rejected this model; folding folds `dt`/`eff` as
+    # watched constants and templates `price`/`dem`/`gcap`/`pmax`, so it engages
+    # the warm path.  We time the warm tick, verify equivalence, and measure the
+    # reload path's cost for one folded-value change event.
+    fold_info = _run_fold_leg(dims, rolls, seed0)
+
     # ----- equivalence gate ------------------------------------------------- #
     max_obj_dev = 0.0
     for oa, of, og, ov in zip(appsi_objs, fs_objs, fa_objs, vg_objs):
@@ -204,6 +214,95 @@ def run_size(size: str, dims: Dict[str, Any], rolls: int, seed0: int) -> Dict[st
         "speedup_array": appsi_ms / fa_ms if fa_ms else None,
         "max_obj_deviation": max_obj_dev,
         "equivalent": equivalent,
+        # verified-static folding leg
+        "fold_engaged": fold_info["engaged"],
+        "fold_n_folded": fold_info["n_folded"],
+        "fold_n_templated": fold_info["n_templated"],
+        "fold_folded_sample": fold_info["folded_sample"],
+        "faststep_fold_ms": fold_info["fold_ms"],
+        "appsi_fold_ms": fold_info["appsi_ms"],
+        "fold_speedup": fold_info["speedup"],
+        "fold_vs_static": fold_info["fold_ms"] / fs_ms if fs_ms else None,
+        "fold_reload_ms": fold_info["reload_ms"],
+        "fold_max_obj_deviation": fold_info["max_obj_dev"],
+        "fold_equivalent": fold_info["equivalent"],
+    }
+
+
+def _run_fold_leg(dims: Dict[str, Any], rolls: int, seed0: int) -> Dict[str, Any]:
+    """Measure the verified-static folding leg on the non-affine-param variant.
+
+    Returns engagement info, the warm-tick medians (faststep-fold and its APPSI
+    baseline), equivalence vs a per-roll fresh build, and the reload cost for one
+    folded-value change event.
+    """
+    # faststep with folding, model-driven
+    m_fo = rolling_mpc.build_pyomo(dims, nonaffine_param=True)
+    fo = FastStepHighs()
+    fo.set_instance(m_fo)
+    rep = fo.classification_report()
+    fo.solve()
+    fold_ticks = []
+    fold_objs = []
+    for r in range(rolls):
+        rolling_mpc.apply_roll(m_fo, np.random.default_rng(seed0 + r))
+        t0 = time.perf_counter()
+        res = fo.solve()
+        fold_ticks.append(time.perf_counter() - t0)
+        fold_objs.append(res.incumbent_objective)
+
+    # APPSI-persistent baseline on the same non-affine-param model
+    m_ap = rolling_mpc.build_pyomo(dims, nonaffine_param=True)
+    appsi = _appsi_persistent(m_ap)
+    appsi.solve(m_ap)
+    appsi_ticks = []
+    appsi_objs = []
+    for r in range(rolls):
+        rolling_mpc.apply_roll(m_ap, np.random.default_rng(seed0 + r))
+        t0 = time.perf_counter()
+        appsi.solve(m_ap)
+        appsi_ticks.append(time.perf_counter() - t0)
+        appsi_objs.append(pyo.value(m_ap.obj))
+
+    # equivalence vs per-roll fresh builds
+    from pyomo.contrib.solver.common.factory import SolverFactory
+
+    fastload = SolverFactory("highs_fastload")
+    max_obj_dev = 0.0
+    for r in range(rolls):
+        mref = rolling_mpc.build_pyomo(dims, nonaffine_param=True)
+        rolling_mpc.apply_roll(mref, np.random.default_rng(seed0 + r))
+        rref = fastload.solve(mref, raise_exception_on_nonoptimal_result=False)
+        scale = max(1.0, abs(rref.incumbent_objective or 0.0))
+        max_obj_dev = max(
+            max_obj_dev, abs(fold_objs[r] - rref.incumbent_objective) / scale
+        )
+
+    # reload path cost: one folded-value (dt) change event under 'reload'
+    m_rl = rolling_mpc.build_pyomo(dims, nonaffine_param=True)
+    rl = FastStepHighs(on_matrix_change="reload")
+    rl.set_instance(m_rl)
+    rl.solve()
+    rolling_mpc.apply_roll(m_rl, np.random.default_rng(seed0))
+    rl.solve()  # a normal (fast) roll
+    m_rl.dt = float(rolling_mpc.DT) * 1.5  # a genuine folded-value change
+    t0 = time.perf_counter()
+    rl.solve()  # triggers re-fold + re-template + fresh passModel
+    reload_s = time.perf_counter() - t0
+
+    fold_ms = _median_ms(fold_ticks)
+    appsi_ms = _median_ms(appsi_ticks)
+    return {
+        "engaged": rep["folding_engaged"],
+        "n_folded": rep["n_folded"],
+        "n_templated": rep["n_templated"],
+        "folded_sample": rep["folded_parameters"][:4],
+        "fold_ms": fold_ms,
+        "appsi_ms": appsi_ms,
+        "speedup": appsi_ms / fold_ms if fold_ms else None,
+        "reload_ms": reload_s * 1e3,
+        "max_obj_dev": max_obj_dev,
+        "equivalent": max_obj_dev < 1e-6,
     }
 
 
@@ -248,6 +347,25 @@ def render_guard_table(rows: List[Dict[str, Any]]) -> str:
     return "\n".join(out)
 
 
+def render_fold_table(rows: List[Dict[str, Any]]) -> str:
+    """The verified-static parameter folding evidence (the new leg)."""
+    out = []
+    out.append(
+        "| size | folded | templated | APPSI (fold model) | faststep (fold) | "
+        "**speedup** | fold vs static | reload (1 event) | equiv |"
+    )
+    out.append("|---|---|---|---|---|---|---|---|---|")
+    for r in rows:
+        out.append(
+            f"| {r['size']} | {r['fold_n_folded']:,} | {r['fold_n_templated']:,} | "
+            f"{r['appsi_fold_ms']:.2f} ms | {r['faststep_fold_ms']:.2f} ms | "
+            f"**{r['fold_speedup']:.2f}x** | {r['fold_vs_static']:.2f}x | "
+            f"{r['fold_reload_ms']:.2f} ms | "
+            f"{'yes' if r['fold_equivalent'] else 'NO'} |"
+        )
+    return "\n".join(out)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--sizes", default="1e4,1e5")
@@ -278,11 +396,22 @@ def main():
             f"equivalent={row['equivalent']}",
             flush=True,
         )
+        print(
+            f"[{size}] fold: engaged={row['fold_engaged']} "
+            f"folded={row['fold_n_folded']} templated={row['fold_n_templated']} "
+            f"| faststep-fold {row['faststep_fold_ms']:.2f} ms "
+            f"({row['fold_speedup']:.2f}x APPSI, {row['fold_vs_static']:.2f}x static)"
+            f" | reload {row['fold_reload_ms']:.2f} ms | "
+            f"equivalent={row['fold_equivalent']}",
+            flush=True,
+        )
 
     print("\n### warm tick vs APPSI-persistent\n")
     print(render_table(rows))
     print("\n### value-aware static-matrix guard\n")
-    print(render_guard_table(rows) + "\n")
+    print(render_guard_table(rows))
+    print("\n### verified-static parameter folding (non-affine-param variant)\n")
+    print(render_fold_table(rows) + "\n")
 
     if a.out:
         with open(a.out, "w") as fh:

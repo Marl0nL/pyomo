@@ -42,8 +42,11 @@ SIZES: Dict[str, Dict[str, Any]] = {
 }
 
 
+DT = 0.25  # interval duration (hours): a practically-constant, mutable Param
+
+
 def build_pyomo(
-    params: Dict[str, Any], mutable_matrix: bool = False
+    params: Dict[str, Any], mutable_matrix: bool = False, nonaffine_param: bool = False
 ) -> pyo.ConcreteModel:
     """Build the rolling-horizon MPC model.
 
@@ -54,6 +57,18 @@ def build_pyomo(
     mutability *flag* says otherwise -- exactly the case the ``highs_faststep``
     value guard exists to accept.  ``False`` (the default) bakes the efficiency in
     as a constant, giving the pure-static-matrix model.
+
+    ``nonaffine_param=True`` additionally introduces a practically-constant but
+    *mutable* interval duration ``dt`` that participates **non-affinely**: the
+    objective cost is ``price[t] * dt`` (a product of two mutable Params) and a
+    self-discharge leak is ``(dt / eff[a,t]) * soc`` (a reciprocal in ``eff``).
+    Neither coefficient is affine in the parameter vector, so the pre-folding
+    interface rejected the model.  Verified-static folding folds ``dt`` (the hub
+    coupling every ``price[t]``) and ``eff`` (forced by the reciprocal) as watched
+    constants and keeps ``price`` / ``dem`` / ``gcap`` / ``pmax`` templated, so the
+    model engages the warm path.  The charge term stays ``eff * p`` (with ``eff``
+    folded to its constant value), so the feasible region matches the base model.
+    Implies ``mutable_matrix`` (``eff`` is mutable).
     """
     A = int(params["A"])
     T = int(params["T"])
@@ -76,7 +91,7 @@ def build_pyomo(
         mutable=True,
     )
 
-    if mutable_matrix:
+    if mutable_matrix or nonaffine_param:
         m.eff = pyo.Param(
             m.A,
             m.T,
@@ -92,16 +107,31 @@ def build_pyomo(
         def _eff(mm, a, t):
             return EFF
 
+    if nonaffine_param:
+        m.dt = pyo.Param(initialize=DT, mutable=True)  # folded (verified-static)
+
+        def _dt(mm):
+            return mm.dt
+
+    else:
+
+        def _dt(mm):
+            return 1.0
+
     m.p = pyo.Var(m.A, m.T, domain=pyo.NonNegativeReals)
     m.soc = pyo.Var(m.A, m.T, bounds=(0.0, SOC_MAX))
 
     def socrule(mm, a, t):
-        if t == 0:
-            return mm.soc[a, t] == _eff(mm, a, t) * mm.p[a, t] - mm.dem[a, t]
-        return (
-            mm.soc[a, t]
-            == mm.soc[a, t - 1] + _eff(mm, a, t) * mm.p[a, t] - mm.dem[a, t]
-        )
+        # Charge stays eff*p (eff folds to its constant value), so the feasible
+        # region matches the base model regardless of dt.
+        charge = _eff(mm, a, t) * mm.p[a, t]
+        prev = 0.0 if t == 0 else mm.soc[a, t - 1]
+        if nonaffine_param:
+            # A small self-discharge leak with a reciprocal (dt / eff) coefficient
+            # on soc -- forces eff to fold (non-affine in itself).
+            leak = (_dt(mm) / mm.eff[a, t]) * mm.soc[a, t] * 0.1
+            return mm.soc[a, t] + leak == prev + charge - mm.dem[a, t]
+        return mm.soc[a, t] == prev + charge - mm.dem[a, t]
 
     m.socc = pyo.Constraint(m.A, m.T, rule=socrule)
     m.grid = pyo.Constraint(
@@ -112,7 +142,7 @@ def build_pyomo(
             m.p[a, t].setub(m.pmax[a, t])
 
     m.obj = pyo.Objective(
-        expr=sum(m.price[t] * m.p[a, t] for a in range(A) for t in range(T))
+        expr=sum(m.price[t] * _dt(m) * m.p[a, t] for a in range(A) for t in range(T))
         + 0.01 * sum(m.soc[a, t] for a in range(A) for t in range(T)),
         sense=pyo.minimize,
     )

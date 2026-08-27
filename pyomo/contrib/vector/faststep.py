@@ -110,6 +110,41 @@ with what affine relation) is a standalone, reusable component: a later batch
 matrix-update path can reuse it to *apply* a genuine change; this guard only
 *detects* change.
 
+Verified-static parameter folding (non-affine param participation)
+------------------------------------------------------------------
+The value guard above lets a *nominally-mutable* matrix coefficient through when
+its value holds still, but it needs the coefficient to be **affine in the
+parameter vector** to template it.  Real models routinely put practically-
+constant mutable Params into **products and reciprocals** with other quantities
+-- ``price[t] * duration`` in the objective, ``efficiency * duration`` and
+``duration / efficiency`` in the matrix.  Such a coefficient is *not* affine in
+the parameters (a product of two mutable Params has a non-constant partial), so
+the affine self-check would reject the whole model even though ``duration`` /
+``efficiency`` never actually change between rolls.
+
+:class:`FastStepHighs` closes that gap by **folding** the verified-static
+parameters.  At ``set_instance`` it classifies each mutable Param
+(:func:`_classify_folded`): a Param that participates *non-affinely* (a
+reciprocal ``1/eff``, or the structural-constant factor of a product coupling
+many coefficients like a single ``duration`` multiplying every ``price[t]``) is
+**folded** -- its current value substituted as a constant during template
+construction -- while the affinely-participating Params stay templated.  After
+folding, ``price[t] * duration`` becomes the affine ``duration_value *
+price[t]`` over the remaining varying ``price[t]``, and template construction
+succeeds; the model that was rejected now engages the warm path.
+
+Every folded Param joins the value-guard watch list: each warm solve verifies
+(vectorized) that the folded values are unchanged from ``set_instance``.  A
+genuine change to a folded value means the templates are stale *by construction*
+-- the default ``on_matrix_change='error'`` fails loud naming the Param, and the
+opt-in ``on_matrix_change='reload'`` re-folds, re-templates, and reloads a fresh
+model for that solve.  Never a silent stale solve.  A product of two *genuinely
+varying* Params (no static factor to fold, e.g. a lone ``p*q``) is still rejected
+loudly -- there is no correct affine template for it.  :attr:`folded_parameters`
+/ :attr:`templated_parameters` / :meth:`classification_report` expose which
+Params were folded vs templated (and an ``INFO`` log line reports it), so a user
+can see why their model engaged and exactly what the guard is watching.
+
 Scope (fail loud, never a stale-matrix solve)
 ---------------------------------------------
 * **Linear** continuous / MIP models only (inherited from the standard-form
@@ -121,10 +156,14 @@ Scope (fail loud, never a stale-matrix solve)
 * **Constraint-matrix coefficients are value-guarded, not assumed static.**  A
   mutable matrix coefficient is accepted (see the value-guard section above); a
   coefficient that stays put warm-solves on the kept basis, one that genuinely
-  changes fails loud or (opt-in) triggers a reload -- never a stale solve.  A
-  coefficient that is genuinely *nonlinear in the parameters* (e.g. a product of
-  two Params) cannot be templated affinely and is still rejected at
-  ``set_instance`` by the template self-check.
+  changes fails loud or (opt-in) triggers a reload -- never a stale solve.
+* **A coefficient non-affine in the parameters** (a product / reciprocal of
+  Params, e.g. ``price*duration``) is handled by folding its verified-static
+  factor (see the folding section above): the practically-constant Param is
+  folded in as a watched constant so the coefficient becomes affine in the
+  remaining varying Params.  A product of two *genuinely-varying* Params (no
+  static factor to fold, a lone ``p*q``) has no correct affine template and is
+  still rejected loudly at ``set_instance``.
 * A **structure change** between solves (a constraint or variable added/removed,
   the objective swapped) is caught by a cheap fingerprint check and rejected --
   the caller must build a fresh :class:`FastStepHighs`.
@@ -134,6 +173,7 @@ from __future__ import annotations
 
 import datetime
 import io
+import logging
 import time
 
 from pyomo.common.dependencies import numpy as np, scipy
@@ -170,12 +210,30 @@ from pyomo.contrib.vector.fastload import (
     compile_to_highs_arrays,
 )
 
+logger = logging.getLogger(__name__)
+
 _inf = float('inf')
 
 # Tolerance for the set_instance self-check (templates must reproduce the
 # compiled standard-form arrays).  Absolute + relative.
 _SELFCHECK_ATOL = 1e-8
 _SELFCHECK_RTOL = 1e-7
+
+# The symbolic derivative mode: ``reverse_symbolic`` returns the derivative as an
+# *expression* (``d(price*dur)/dprice == dur``), so a partial that still
+# references another varying parameter is detectable as non-constant.  (The
+# default ``reverse_numeric`` bakes in the current values of the other params, so
+# a genuinely non-affine product yields a numerically-constant -- and therefore
+# *wrong* -- partial.)  Used for both the fold classification and the affine
+# decomposition below.
+_REVSYM = 'reverse_symbolic'
+
+# Sentinel returned by :func:`_affine_over_varying` for an entry that is
+# genuinely non-affine in a *varying* parameter (a product/reciprocal of two
+# varying params) -- distinct from ``None`` (a fixed-variable residual, evaluated
+# per-solve).  A ``_NONAFFINE`` entry that survives fold classification is
+# rejected loudly at ``set_instance`` (it can never be templated correctly).
+_NONAFFINE = object()
 
 
 # --------------------------------------------------------------------------- #
@@ -239,17 +297,31 @@ class _AffineArray:
         return bool(self.residual)
 
 
-def _affine_over_params(e, param_index):
-    """Decompose ``e`` into ``(shift, {param_pos: coef})`` if it is affine in the
-    mutable parameters and references no (fixed) variable; else return ``None``.
+def _affine_over_varying(e, param_index, folded_ids):
+    """Decompose ``e`` affinely over the **varying** parameter vector.
 
-    A non-constant derivative w.r.t. any parameter (e.g. a product of two
-    parameters) means ``e`` is not affine -> ``None`` -> the caller keeps the
-    entry as a residual.
+    ``folded_ids`` is the set of ``id(ParamData)`` that have been *folded* --
+    treated as watched constants at their current values (see
+    :func:`_classify_folded`).  A folded parameter contributes its current value
+    to the constant term but never a template column, so a product like
+    ``price * duration`` with ``duration`` folded decomposes to the affine
+    ``duration_value * price`` over the remaining varying parameter ``price``.
+
+    Returns:
+
+    * ``(shift, {param_pos: coef})`` when ``e`` is affine in the varying
+      parameters (folded parameters treated as constants);
+    * ``None`` when ``e`` references a (fixed) variable -- a *residual*, evaluated
+      per-solve with ``value()`` (correctness preserved, that entry not
+      vectorized);
+    * :data:`_NONAFFINE` when ``e`` is genuinely non-affine in a *varying*
+      parameter (a product/reciprocal of two varying params that folding did not
+      resolve) -- the caller rejects the model loudly.
     """
-    # Fast path: a bare mutable parameter (``price[t]``) -- the dominant case --
-    # maps to a single unit gather with no derivative work.
+    # Fast path: a bare mutable parameter (``price[t]``) -- the dominant case.
     if getattr(e, 'is_parameter_type', _false)():
+        if id(e) in folded_ids:
+            return float(value(e)), {}  # a bare folded param is a constant
         return 0.0, {param_index[id(e)]: 1.0}
     # A (fixed) variable in the expression makes the constant term depend on a
     # value that is not in the parameter vector -> evaluate as a residual.
@@ -258,11 +330,18 @@ def _affine_over_params(e, param_index):
     coefs = {}
     shift = float(value(e))
     for p in identify_mutable_parameters(e):
-        d = differentiate(e, wrt=p)
-        if not is_constant(d):
-            return None
+        pid = id(p)
+        if pid in folded_ids:
+            continue  # folded -> constant; its value is already folded into shift
+        d = differentiate(e, wrt=p, mode=_REVSYM)
+        # ``e`` is affine in the varying param ``p`` iff its symbolic derivative
+        # references *no varying parameter* (it may reference folded ones -- those
+        # are constants).  A varying reference means a genuine coupling.
+        for pp in identify_mutable_parameters(d):
+            if id(pp) not in folded_ids:
+                return _NONAFFINE
         c = float(value(d))
-        coefs[param_index[id(p)]] = c
+        coefs[param_index[pid]] = c
         shift -= c * float(value(p))
     return shift, coefs
 
@@ -271,13 +350,15 @@ def _false():
     return False
 
 
-def _build_affine_array(slots, param_index, n_params, open_sign):
+def _build_affine_array(slots, param_index, n_params, open_sign, folded_ids, what):
     """Build an :class:`_AffineArray` from a list of bound/coefficient ``slots``.
 
     Each slot is ``None`` (an open bound side -> ``open_sign * inf`` in ``base``),
     a plain ``float`` (a fixed value kept in ``base``), or a Pyomo expression
-    (templated when affine in the parameters, else recorded as a residual and
-    evaluated with ``value()`` every solve).
+    (templated when affine in the varying parameters, folded parameters treated
+    as constants; a fixed-variable entry recorded as a residual and evaluated
+    with ``value()`` every solve).  ``what`` names the group for a fail-loud
+    message if an entry is genuinely non-affine in a varying parameter.
     """
     n = len(slots)
     rows = []
@@ -291,9 +372,20 @@ def _build_affine_array(slots, param_index, n_params, open_sign):
         elif s.__class__ is float or s.__class__ is int:
             base[i] = float(s)
         else:
-            aff = _affine_over_params(s, param_index)
+            aff = _affine_over_varying(s, param_index, folded_ids)
             if aff is None:
                 residual.append((i, s))
+            elif aff is _NONAFFINE:
+                params = sorted({p.name for p in identify_mutable_parameters(s)})
+                raise IncompatibleModelError(
+                    f"The '{FastStepHighs.name}' warm interface found a {what} that "
+                    "is non-affine in the varying parameters and could not be made "
+                    "affine by folding a verified-static parameter (its factors "
+                    f"[{', '.join(params)}] all vary): a product/reciprocal of two "
+                    "genuinely-mutable parameters cannot be templated.  Declare one "
+                    "factor immutable (or use 'highs_fastload' for a fresh compile "
+                    "per solve)."
+                )
             else:
                 shift, coefs = aff
                 base[i] = shift
@@ -305,6 +397,82 @@ def _build_affine_array(slots, param_index, n_params, open_sign):
         (np.asarray(data, dtype=np.float64), (rows, cols)), shape=(n, n_params)
     )
     return _AffineArray(M, base, residual)
+
+
+def _classify_folded(coef_exprs, hub_min=2):
+    """Decide which mutable parameters to **fold** (treat as watched constants).
+
+    ``coef_exprs`` is the list of mutable coefficient / bound expressions across
+    every template group (objective coefficients and offset, row bounds/RHS,
+    variable bounds, matrix coefficients).  A parameter is *folded* -- its current
+    value substituted as a constant during template construction -- when it
+    participates **non-affinely** and folding it is what makes the remaining
+    (varying) parameters affine.  Two reasons force a fold:
+
+    * **Self-coupling (forced).**  A parameter that appears in its *own* symbolic
+      derivative -- a reciprocal ``1/eff`` or a power ``dur**2`` -- is non-affine
+      in itself and can never be templated; it must be folded.
+    * **A hub coupling (greedy).**  Two varying parameters multiplied together
+      (``price[t] * duration``) are mutually non-affine; folding either resolves
+      it.  We fold the parameter appearing in the *most* such couplings -- the
+      structural constant (a single ``duration`` coupling every ``price[t]``)
+      rather than the many varying data parameters.  A coupling with no hub (two
+      co-equal single-use parameters, e.g. a lone ``p*q``) is left unfolded and
+      rejected downstream: with no evidence which factor is static, folding one
+      would be a coin-flip that the value guard would trip every roll.
+
+    Returns ``(folded_ids: set, names: dict[id -> Param.name])``.  The fold set
+    is a *best effort* to make the templates affine; the ``set_instance``
+    self-check remains the hard correctness gate, and every folded parameter is
+    watched by the value guard (a genuine change fails loud or, opt-in, reloads).
+    """
+    couplings = []  # per-expr {param_id: frozenset(dep param ids in d/dp)}
+    names = {}
+    for e in coef_exprs:
+        if getattr(e, 'is_parameter_type', _false)():
+            couplings.append({id(e): frozenset()})
+            names[id(e)] = e.name
+            continue
+        if any(True for _ in identify_variables(e, include_fixed=True)):
+            couplings.append({})  # fixed-variable residual: no param templating
+            continue
+        cmap = {}
+        for p in identify_mutable_parameters(e):
+            names[id(p)] = p.name
+            d = differentiate(e, wrt=p, mode=_REVSYM)
+            cmap[id(p)] = frozenset(id(pp) for pp in identify_mutable_parameters(d))
+        couplings.append(cmap)
+
+    # Forced folds: a parameter non-affine in itself (reciprocal / power).
+    folded = set()
+    for cmap in couplings:
+        for pid, deps in cmap.items():
+            if pid in deps:
+                folded.add(pid)
+
+    # Greedy hub folding for the remaining product couplings.
+    while True:
+        cover = {}  # candidate param id -> set of conflict-expr indices it resolves
+        any_conflict = False
+        for ei, cmap in enumerate(couplings):
+            for pid, deps in cmap.items():
+                if pid in folded:
+                    continue
+                residual = deps - folded
+                if residual:
+                    any_conflict = True
+                    cover.setdefault(pid, set()).add(ei)
+                    for did in residual:
+                        cover.setdefault(did, set()).add(ei)
+        if not any_conflict:
+            break
+        # Fold the hub: the candidate resolving the most distinct couplings
+        # (deterministic tie-break by name).
+        best = max(cover, key=lambda k: (len(cover[k]), names.get(k, '')))
+        if len(cover[best]) < hub_min:
+            break  # no hub -- leave the residual couplings to be rejected
+        folded.add(best)
+    return folded, names
 
 
 # --------------------------------------------------------------------------- #
@@ -415,11 +583,20 @@ class _MutablePlan:
         'col_lower_affine',
         'col_upper_affine',
         'matrix_guard',
+        'folded_params',
+        'folded_baseline',
     )
 
     def read_param_vector(self):
         return np.fromiter(
             (p.value for p in self.params), dtype=np.float64, count=len(self.params)
+        )
+
+    def read_folded_vector(self):
+        return np.fromiter(
+            (p.value for p in self.folded_params),
+            dtype=np.float64,
+            count=len(self.folded_params),
         )
 
     @property
@@ -559,17 +736,53 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
         col_lower_slots.append(lb if lb_mut else float(compiled.col_lower[j]))
         col_upper_slots.append(ub if ub_mut else float(compiled.col_upper[j]))
 
-    # --- parameter registry (ordered P) ------------------------------------- #
+    # --- verified-static parameter folding (classification) ----------------- #
+    # A mutable parameter that participates *non-affinely* (a product/reciprocal
+    # with other quantities -- ``price*duration`` in the objective,
+    # ``efficiency*duration`` / ``duration/efficiency`` in the matrix) cannot be
+    # templated affinely and would otherwise sink the whole model to a fail-loud
+    # rejection.  Classify each parameter: fold the non-affine (structurally
+    # constant) ones as watched constants, keep the affinely-participating ones
+    # varying.  After folding, ``price*duration`` becomes the affine
+    # ``duration_value * price`` over the remaining varying ``price``.  Every
+    # folded parameter is watched by the value guard (below): a genuine change to
+    # a folded value means the templates are stale, so it fails loud (or, opt-in,
+    # reloads) -- never a silent stale solve.
+    all_slots = (
+        obj_slots
+        + ([obj_offset_slot] if obj_offset_slot is not None else [])
+        + row_lower_slots
+        + row_upper_slots
+        + col_lower_slots
+        + col_upper_slots
+        + mat_slots
+    )
+    coef_exprs = [
+        s
+        for s in all_slots
+        if s is not None and s.__class__ is not float and s.__class__ is not int
+    ]
+    folded_ids, _fold_names = _classify_folded(coef_exprs)
+
+    # --- parameter registry (ordered P, varying params only) ---------------- #
     params = []
     param_index = {}
+    folded_params = []
+    folded_seen = set()
 
     def _register(slots):
         for s in slots:
             if s is None or s.__class__ is float or s.__class__ is int:
                 continue
             for p in identify_mutable_parameters(s):
-                if id(p) not in param_index:
-                    param_index[id(p)] = len(params)
+                pid = id(p)
+                if pid in folded_ids:
+                    if pid not in folded_seen:
+                        folded_seen.add(pid)
+                        folded_params.append(p)
+                    continue
+                if pid not in param_index:
+                    param_index[pid] = len(params)
                     params.append(p)
 
     _register(obj_slots)
@@ -582,34 +795,49 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
     _register(mat_slots)
     n_params = len(params)
 
-    # --- affine templates --------------------------------------------------- #
+    # --- affine templates (folded params baked in as constants) ------------- #
     plan = _MutablePlan()
     plan.params = params
     plan.param_index = param_index
+    plan.folded_params = folded_params
+    plan.folded_baseline = np.fromiter(
+        (p.value for p in folded_params), dtype=np.float64, count=len(folded_params)
+    )
     plan.obj_cols = np.fromiter(obj_cols, dtype=np.int32, count=len(obj_cols))
-    plan.obj_affine = _build_affine_array(obj_slots, param_index, n_params, +1)
+    plan.obj_affine = _build_affine_array(
+        obj_slots, param_index, n_params, +1, folded_ids, 'objective coefficient'
+    )
     plan.obj_offset_affine = (
         None
         if obj_offset_slot is None
-        else _build_affine_array([obj_offset_slot], param_index, n_params, +1)
+        else _build_affine_array(
+            [obj_offset_slot], param_index, n_params, +1, folded_ids, 'objective offset'
+        )
     )
     plan.row_idx = np.fromiter(row_idx, dtype=np.int32, count=len(row_idx))
     plan.row_lower_affine = _build_affine_array(
-        row_lower_slots, param_index, n_params, -1
+        row_lower_slots, param_index, n_params, -1, folded_ids, 'row lower bound'
     )
     plan.row_upper_affine = _build_affine_array(
-        row_upper_slots, param_index, n_params, +1
+        row_upper_slots, param_index, n_params, +1, folded_ids, 'row upper bound'
     )
     plan.col_idx = np.fromiter(col_idx, dtype=np.int32, count=len(col_idx))
     plan.col_lower_affine = _build_affine_array(
-        col_lower_slots, param_index, n_params, -1
+        col_lower_slots, param_index, n_params, -1, folded_ids, 'variable lower bound'
     )
     plan.col_upper_affine = _build_affine_array(
-        col_upper_slots, param_index, n_params, +1
+        col_upper_slots, param_index, n_params, +1, folded_ids, 'variable upper bound'
     )
 
     # --- matrix-coefficient template (the value guard) ---------------------- #
-    matrix_affine = _build_affine_array(mat_slots, param_index, n_params, +1)
+    matrix_affine = _build_affine_array(
+        mat_slots,
+        param_index,
+        n_params,
+        +1,
+        folded_ids,
+        'constraint matrix coefficient',
+    )
     mat_rows_arr = np.fromiter(mat_rows, dtype=np.int32, count=len(mat_rows))
     mat_cols_arr = np.fromiter(mat_cols, dtype=np.int32, count=len(mat_cols))
     if mat_rows:
@@ -686,7 +914,29 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
     plan.matrix_guard = _MatrixGuard(
         mat_rows_arr, mat_cols_arr, matrix_affine, baseline, mat_prov
     )
+
+    # --- classification transparency ---------------------------------------- #
+    if folded_params:
+        logger.info(
+            "%s: verified-static parameter folding engaged -- folded %d "
+            "parameter(s) as watched constants (%s); %d parameter(s) remain "
+            "templated (varying).  A genuine change to a folded value trips the "
+            "value guard (fail-loud by default; on_matrix_change='reload' "
+            "re-folds).",
+            FastStepHighs.name,
+            len(folded_params),
+            _abbrev_names([p.name for p in folded_params]),
+            len(params),
+        )
     return plan
+
+
+def _abbrev_names(names, limit=12):
+    """A compact, deterministic rendering of a name list for a log/report line."""
+    names = list(names)
+    if len(names) <= limit:
+        return ", ".join(names)
+    return ", ".join(names[:limit]) + f", ... (+{len(names) - limit} more)"
 
 
 def _eval_slots(slots, open_sign, hinf):
@@ -1029,6 +1279,48 @@ class FastStepHighs:
             f"stale matrix.{remedy}\n{details}"
         )
 
+    def _folded_change_error(self, plan, changed, current, array_mode):
+        idx = np.nonzero(changed)[0]
+        lines = []
+        for k in idx[:8]:
+            p = plan.folded_params[int(k)]
+            lines.append(
+                f"  - parameter '{p.name}': {plan.folded_baseline[k]!r} -> "
+                f"{current[k]!r}"
+            )
+        if len(idx) > 8:
+            lines.append(f"  - ... and {len(idx) - 8} more")
+        details = "\n".join(lines)
+        if array_mode:
+            remedy = (
+                " The array-driven (param_values) path cannot reload from the "
+                "model, so a folded-parameter change is always fatal here; drive "
+                "the solve from the model (omit param_values) with "
+                "on_matrix_change='reload' to re-fold and rebuild instead."
+            )
+        else:
+            remedy = (
+                " Set on_matrix_change='reload' to re-fold, rebuild the templates, "
+                "and reload the model (basis reset) for this solve instead of "
+                "failing."
+            )
+        return IncompatibleModelError(
+            f"The '{self.name}' warm interface detected a genuine change in "
+            f"{int(changed.sum())} folded (verified-static) parameter(s) since "
+            "set_instance; their set_instance values were substituted as constants "
+            f"in the affine templates, so a warm re-solve would use stale "
+            f"templates.{remedy}\n{details}"
+        )
+
+    def _reload_full(self):
+        """Re-run ``set_instance``: re-classify the fold set at the model's
+        current values, rebuild every affine template, and load a fresh model
+        (basis reset).  Used when a *folded* (verified-static) parameter genuinely
+        changed under ``on_matrix_change='reload'`` -- the templates themselves
+        must change (a re-fold), so the lighter matrix-only :meth:`_reload_model`
+        is not enough."""
+        self.set_instance(self._model)
+
     def _reload_model(self, P, hinf):
         """Rebuild + reload the whole matrix (the ``on_matrix_change='reload'``
         path): a fresh standard-form compile and ``passModel`` (basis reset).
@@ -1081,6 +1373,29 @@ class FastStepHighs:
                     "(non-parameter-affine) entries; drive the solve from the "
                     "model instead (omit param_values)."
                 )
+
+        # --- verified-static parameter fold guard: never solve stale templates - #
+        # A folded parameter had its set_instance value baked into every template
+        # that referenced it (a ``price*duration`` objective coefficient became
+        # ``duration_value * price``).  If a folded value genuinely changed, those
+        # templates are stale by construction -- verify (vectorized) before
+        # touching the solver.  Unchanged -> the fast path; changed -> fail loud,
+        # or (opt-in) re-fold + re-template + fresh passModel; never a stale solve.
+        if plan.folded_params:
+            fcur = plan.read_folded_vector()
+            fchanged = np.abs(fcur - plan.folded_baseline) > (
+                self._matrix_atol + self._matrix_rtol * np.abs(plan.folded_baseline)
+            )
+            if fchanged.any():
+                array_mode = param_values is not None
+                if self._on_matrix_change == 'reload' and not array_mode:
+                    # Re-classify folds at the new values, rebuild the templates,
+                    # and load a fresh model (basis reset) for this solve.  The
+                    # fresh compile bakes in the current data, so the incremental
+                    # push below is skipped.
+                    self._reload_full()
+                    return
+                raise self._folded_change_error(plan, fchanged, fcur, array_mode)
 
         # --- value-aware static-matrix guard: never solve a stale matrix ------ #
         # Re-evaluate the mutable matrix coefficients (vectorized) and compare to
@@ -1176,6 +1491,43 @@ class FastStepHighs:
         """The current parameter vector ``P`` read from the model (``float64``)."""
         self._require_loaded()
         return self._plan.read_param_vector()
+
+    # ------------------------------------------------------------------ #
+    # fold classification transparency
+    # ------------------------------------------------------------------ #
+    @property
+    def folded_parameters(self):
+        """Names of the mutable parameters that were **folded** -- their
+        ``set_instance`` values substituted as constants in the affine templates
+        (because they participate non-affinely, e.g. ``price*duration``) and
+        watched by the value guard for any subsequent change.  Empty when the
+        model is fully affine in its parameters (nothing needed folding)."""
+        self._require_loaded()
+        return [p.name for p in self._plan.folded_params]
+
+    @property
+    def templated_parameters(self):
+        """Names of the mutable parameters that remain **templated** (varying) --
+        the parameter vector ``P`` the warm update path expands with ``M @ P``."""
+        self._require_loaded()
+        return [p.name for p in self._plan.params]
+
+    def classification_report(self):
+        """A readable dict of the fold classification: which parameters are folded
+        (watched constants) vs templated (varying).  Lets a caller see *why* a
+        model engaged the warm path and exactly what the value guard is watching.
+        """
+        self._require_loaded()
+        folded = self.folded_parameters
+        templated = self.templated_parameters
+        return {
+            'n_folded': len(folded),
+            'n_templated': len(templated),
+            'folded_parameters': folded,
+            'templated_parameters': templated,
+            'folding_engaged': bool(folded),
+            'on_folded_change': self._on_matrix_change,
+        }
 
     # ------------------------------------------------------------------ #
     # explicit array update API (raw index-addressed pushes)

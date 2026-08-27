@@ -160,14 +160,17 @@ feature stays additive under `pyomo.contrib.vector`.
   this change.
 * Everything else inherited from Phase 4 (linear-only, structure-fingerprint
   check, residual fallback) is unchanged.
-* **Not yet handled: a mutable param that appears as a *bilinear* (or otherwise
-  non-affine) coefficient** — e.g. an interval duration that multiplies *both* a
-  price and a power variable, so a coefficient is `price · duration` or
-  `efficiency · duration`. Such a coefficient is not affine in the parameter
-  vector, so the affine self-check rejects the model at `set_instance` (objective
-  *and* matrix). A natural follow-up — fold a *verified-static* mutable param in
-  as a constant across **all** templates, then value-guard it — would make these
-  models fully vectorizable; it is deliberately out of scope here.
+* **A mutable param that appears as a *bilinear* (or otherwise non-affine)
+  coefficient** — e.g. an interval duration that multiplies *both* a price and a
+  power variable, so a coefficient is `price · duration` or `efficiency ·
+  duration`. Such a coefficient is not affine in the parameter vector, so the
+  affine self-check rejected the model at `set_instance` (objective *and*
+  matrix). **Update:** this is now handled by **verified-static parameter
+  folding** — a practically-constant mutable param is folded in as a constant
+  across **all** templates (so `price · duration` becomes the affine
+  `duration_value · price`) and value-guarded like the matrix coefficients here;
+  see `bench/STATICFOLD_REPORT.md`. A product of two *genuinely-varying* params
+  (no static factor) is still rejected loudly.
 
 ---
 
