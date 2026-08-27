@@ -783,5 +783,262 @@ class TestFastStepMatrixGuard(unittest.TestCase):
             FastStepHighs().set_instance(m, on_matrix_change="bogus")
 
 
+# --------------------------------------------------------------------------- #
+# A model whose mutable Params participate NON-affinely: a practically-constant
+# ``dur`` (interval duration) multiplies every ``price[t]`` in the objective and
+# couples with a mutable ``eff[a,t]`` in the matrix as ``eff*dur`` (product) and
+# ``dur/eff`` (reciprocal).  Neither coefficient is affine in the parameter
+# vector, so the pre-folding interface rejected the model outright.  Verified-
+# static folding folds ``dur`` and ``eff`` (watched constants) and keeps
+# ``price``/``dem`` templated -- the external case's shape, synthetic.
+# --------------------------------------------------------------------------- #
+def _folded_param_model(A=3, T=4, dur=0.5, eff=0.9):
+    m = pyo.ConcreteModel()
+    m.A = pyo.RangeSet(0, A - 1)
+    m.T = pyo.RangeSet(0, T - 1)
+    m.dur = pyo.Param(initialize=dur, mutable=True)  # folded (hub of price*dur)
+    m.price = pyo.Param(m.T, initialize={t: 1.0 for t in range(T)}, mutable=True)
+    m.dem = pyo.Param(
+        m.A,
+        m.T,
+        initialize={(a, t): 0.5 for a in range(A) for t in range(T)},
+        mutable=True,
+    )
+    m.eff = pyo.Param(
+        m.A,
+        m.T,
+        initialize={(a, t): eff for a in range(A) for t in range(T)},
+        mutable=True,
+    )  # folded (reciprocal dur/eff forces it)
+    m.p = pyo.Var(m.A, m.T, domain=pyo.NonNegativeReals, bounds=(0, 5))
+    m.soc = pyo.Var(m.A, m.T, bounds=(0.0, 40.0))
+
+    def socrule(mm, a, t):
+        # eff*dur (product) on the charge term; dur/eff (reciprocal) leak term.
+        prev = 0.0 if t == 0 else mm.soc[a, t - 1]
+        leak = mm.dur / mm.eff[a, t] * mm.soc[a, t]
+        return mm.soc[a, t] + leak == (
+            prev + mm.eff[a, t] * mm.dur * mm.p[a, t] - mm.dem[a, t]
+        )
+
+    m.socc = pyo.Constraint(m.A, m.T, rule=socrule)
+    m.obj = pyo.Objective(
+        expr=sum(m.price[t] * m.dur * m.p[a, t] for a in range(A) for t in range(T))
+        + 0.01 * sum(m.soc[a, t] for a in range(A) for t in range(T)),
+        sense=pyo.minimize,
+    )
+    return m
+
+
+def _roll_folded_model(m, rng):
+    """Equal-interval roll: price/demand move; dur/eff (folded) stay put."""
+    A = len(m.A)
+    T = len(m.T)
+    for t in range(T):
+        m.price[t] = float(rng.uniform(0.5, 3.0))
+    for a in range(A):
+        for t in range(T):
+            m.dem[a, t] = float(rng.uniform(0.0, 1.0))
+
+
+@unittest.skipUnless(_deps, "highs_faststep requires numpy/scipy/highspy")
+class TestFastStepFolding(unittest.TestCase):
+    """Verified-static parameter folding: non-affine param products engage."""
+
+    def setUp(self):
+        import pyomo.contrib.vector  # noqa: F401
+        from pyomo.contrib.solver.common.results import TerminationCondition
+        from pyomo.contrib.solver.common.util import IncompatibleModelError
+
+        self.TC = TerminationCondition
+        self.Err = IncompatibleModelError
+
+    def test_folding_engages_and_reports(self):
+        # dur and every eff[a,t] fold (non-affine); price/dem stay templated.
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _folded_param_model()
+        s = FastStepHighs()
+        s.set_instance(m)  # would have rejected pre-folding
+        rep = s.classification_report()
+        self.assertTrue(rep['folding_engaged'])
+        self.assertIn('dur', s.folded_parameters)
+        self.assertTrue(any(n.startswith('eff') for n in s.folded_parameters))
+        self.assertTrue(
+            all(n.startswith(('price', 'dem')) for n in s.templated_parameters)
+        )
+        self.assertFalse(
+            any(n.startswith(('dur', 'eff')) for n in s.templated_parameters)
+        )
+        res = s.solve()
+        self.assertEqual(
+            res.termination_condition, self.TC.convergenceCriteriaSatisfied
+        )
+
+    def test_folded_rolling_matches_fresh(self):
+        # The rolling sequence matches a per-roll fresh build, both basis modes.
+        from pyomo.contrib.vector import FastStepHighs
+
+        for keep_basis in (True, False):
+            m = _folded_param_model()
+            s = FastStepHighs()
+            s.set_instance(m)
+            s.solve(keep_basis=keep_basis)
+            for roll in range(6):
+                _roll_folded_model(m, np.random.default_rng(roll))
+                res = s.solve(keep_basis=keep_basis)
+                mref = _folded_param_model()
+                _roll_folded_model(mref, np.random.default_rng(roll))
+                rref = _fastload().solve(
+                    mref, raise_exception_on_nonoptimal_result=False
+                )
+                self.assertEqual(
+                    res.termination_condition,
+                    rref.termination_condition,
+                    msg=f"tc mismatch roll {roll} keep_basis={keep_basis}",
+                )
+                if res.termination_condition == self.TC.convergenceCriteriaSatisfied:
+                    self.assertAlmostEqual(
+                        res.incumbent_objective,
+                        rref.incumbent_objective,
+                        delta=1e-6 * max(1.0, abs(rref.incumbent_objective)),
+                        msg=f"obj mismatch roll {roll} keep_basis={keep_basis}",
+                    )
+
+    def test_folded_array_path_matches_model(self):
+        # The array-driven (mapping-free) path drives the same folded templates.
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _folded_param_model()
+        s = FastStepHighs()
+        s.set_instance(m)
+        params = s.parameters
+        s.solve()
+        for roll in range(4):
+            _roll_folded_model(m, np.random.default_rng(50 + roll))
+            P = np.fromiter((p.value for p in params), np.float64, len(params))
+            res = s.solve(param_values=P)
+            mref = _folded_param_model()
+            _roll_folded_model(mref, np.random.default_rng(50 + roll))
+            rref = _fastload().solve(mref)
+            self.assertAlmostEqual(
+                res.incumbent_objective,
+                rref.incumbent_objective,
+                delta=1e-6 * max(1.0, abs(rref.incumbent_objective)),
+            )
+
+    def test_folded_param_change_fails_loud(self):
+        # A genuine change to a folded param (default policy) fails loud, naming
+        # the parameter -- never a stale-template solve.
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _folded_param_model()
+        s = FastStepHighs()  # default on_matrix_change='error'
+        s.set_instance(m)
+        s.solve()
+        m.dur = 0.75  # folded value genuinely changed
+        with self.assertRaises(self.Err) as ctx:
+            s.solve()
+        msg = str(ctx.exception)
+        self.assertIn('folded', msg.lower())
+        self.assertIn('dur', msg)
+
+    def test_folded_param_change_reload(self):
+        # on_matrix_change='reload' re-folds + re-templates + fresh model; the
+        # reloaded solve and subsequent static rolls match fresh builds.
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _folded_param_model()
+        s = FastStepHighs(on_matrix_change='reload')
+        s.set_instance(m)
+        s.solve()
+        _roll_folded_model(m, np.random.default_rng(3))
+        s.solve()
+        m.dur = 0.95  # folded change -> reload
+        res = s.solve()
+
+        def _fresh_like(model):
+            mref = _folded_param_model(dur=pyo.value(model.dur))
+            for t in range(len(model.T)):
+                mref.price[t] = pyo.value(model.price[t])
+            for a in range(len(model.A)):
+                for t in range(len(model.T)):
+                    mref.dem[a, t] = pyo.value(model.dem[a, t])
+            return _fastload().solve(mref)
+
+        rref = _fresh_like(m)
+        self.assertAlmostEqual(
+            res.incumbent_objective,
+            rref.incumbent_objective,
+            delta=1e-6 * max(1.0, abs(rref.incumbent_objective)),
+        )
+        # dur is now re-folded at 0.95; a subsequent static roll still matches.
+        _roll_folded_model(m, np.random.default_rng(11))
+        res = s.solve()
+        rref = _fresh_like(m)
+        self.assertAlmostEqual(
+            res.incumbent_objective,
+            rref.incumbent_objective,
+            delta=1e-6 * max(1.0, abs(rref.incumbent_objective)),
+        )
+
+    def test_folded_change_array_mode_fatal(self):
+        # The array path cannot reload; a folded change is fatal even under
+        # on_matrix_change='reload'.
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _folded_param_model()
+        s = FastStepHighs(on_matrix_change='reload')
+        s.set_instance(m)
+        params = s.parameters
+        s.solve()
+        m.dur = 0.75  # folded param changed in the model
+        P = np.fromiter((p.value for p in params), np.float64, len(params))
+        with self.assertRaises(self.Err):
+            s.solve(param_values=P)
+
+    def test_reciprocal_param_folds_and_solves(self):
+        # A lone reciprocal coefficient (dur/eff) forces eff to fold; the model
+        # engages and warm-solves.
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = pyo.ConcreteModel()
+        m.dur = pyo.Param(initialize=2.0, mutable=True)
+        m.eff = pyo.Param(initialize=0.5, mutable=True)
+        m.x = pyo.Var(domain=pyo.NonNegativeReals, bounds=(0, 10))
+        m.c = pyo.Constraint(expr=(m.dur / m.eff) * m.x <= 8)  # coef 4.0
+        m.obj = pyo.Objective(expr=m.x, sense=pyo.maximize)
+        s = FastStepHighs()
+        s.set_instance(m)
+        self.assertIn('eff', s.folded_parameters)
+        s.solve()
+        self.assertAlmostEqual(pyo.value(m.x), 2.0, places=6)  # 8 / (2/0.5)
+
+    def test_lone_objective_bilinear_rejected(self):
+        # Two co-equal, single-use varying params multiplied (p*q) in the
+        # objective: no static factor to fold -> rejected loudly (as before).
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = pyo.ConcreteModel()
+        m.p = pyo.Param(initialize=2.0, mutable=True)
+        m.q = pyo.Param(initialize=3.0, mutable=True)
+        m.x = pyo.Var(domain=pyo.NonNegativeReals, bounds=(0, 10))
+        m.c = pyo.Constraint(expr=m.x <= 5)
+        m.obj = pyo.Objective(expr=m.p * m.q * m.x, sense=pyo.maximize)
+        with self.assertRaises(self.Err):
+            FastStepHighs().set_instance(m)
+
+    def test_no_folding_when_all_affine(self):
+        # A model whose params are all affine (the base MPC): nothing is folded,
+        # behavior is unchanged.
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _mpc_model(A=3, T=4)
+        s = FastStepHighs()
+        s.set_instance(m)
+        self.assertEqual(s.folded_parameters, [])
+        self.assertFalse(s.classification_report()['folding_engaged'])
+
+
 if __name__ == "__main__":
     unittest.main()
