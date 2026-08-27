@@ -35,7 +35,18 @@ coefficients via a value-aware guard (verify the values each roll, not the
 mutability flag) — see `bench/VALUEGUARD_REPORT.md` — and engages on models with
 **non-affine** param participation (`price*duration`, `dur/eff`) by **folding**
 the verified-static params as watched constants — see `bench/STATICFOLD_REPORT.md`
-(`FastStepHighs.classification_report()` shows what folded). All three routes also
+(`FastStepHighs.classification_report()` shows what folded). `highs_faststep` also
+does **masked warm updates** — a solver-side overlay of **row masks** (relax rows
+to free: `deactivate_rows`/`activate_rows`) + **variable fixes** (pin to a value via
+equal bounds: `fix_variables`/`unfix_variables`, or `set_window`/`clear_window` for
+both) that narrows a rolling MPC's **active window** without a structural change
+(the matrix/fingerprint/guard/fold set are untouched, so it stays on the warm path).
+On the window this is provably the structurally-narrowed problem (a fixed
+out-of-window var on an in-window row = the boundary condition); the reported
+objective includes the fixed vars' constant, `masked_objective_constant()` returns
+it. Array-first (bool masks + fix-value arrays) for an external adapter. Equivalence
+gated vs a fresh narrowed build in `tests/test_faststep_masked.py`; see
+`bench/MPC_NARROW_REPORT.md`. All three routes also
 support a **convex-quadratic objective** (`c@x + 0.5*x@Q@x`, the #1761 use case):
 `VectorObjective(quadratic=Q)` explicit API, `highs_fastload` for a classic
 `x[i]*x[j]` objective, and `highs_faststep` with a *static* Hessian (mutable Q
@@ -77,7 +88,8 @@ The ragged `supply_chain` runs the full vector fast path via
   needs numpy/scipy/highspy, gurobipy optional). Cold-stage + vector-path benches via
   `bench/run_bench.py` (`--backends pyomo,pyomo_vector`), the warm-tick bench via
   `python -m bench.warm_faststep`, the mutation-cycle bench via `python -m bench.mutation_cycle`,
-  the faststep-over-switch-on bench via `python -m bench.faststep_templatized` (`--mutbound` for the mixed case).
+  the faststep-over-switch-on bench via `python -m bench.faststep_templatized` (`--mutbound` for the mixed case),
+  the MPC-window-narrowing bench (masked warm vs fresh structural narrow) via `python -m bench.mpc_narrow_faststep`.
 - Tests: `pytest pyomo/contrib/vector/tests/` (mutation: `test_mutation.py`,
   sparse/ragged index: `test_sparse.py`, faststep-over-switch-on: `test_faststep_templatized.py`).
 

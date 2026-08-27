@@ -30,6 +30,7 @@ import pyomo.contrib.vector   # importing registers highs_fastload / gurobi_fast
 | an **unmodified classic** linear/MIP/convex-QP model | solve it faster with **no model change** | **`SolverFactory('highs_fastload')`** (or `gurobi_fastload`) | `bench/PHASE2_REPORT.md`, `bench/GUROBI_FASTLOAD_REPORT.md` |
 | classic `Constraint(index, rule=...)` code | make **construction** faster too, no rewrite | **`vectorized_construction()`** switch + `highs_fastload` | `bench/PHASE3_REPORT.md` |
 | a rolling-horizon / MPC loop (re-solve thousands of times), classic **or** `vectorized_construction()`-built | warm re-solve pushing changed data as arrays | **`FastStepHighs`** | `bench/PHASE4_REPORT.md`, `bench/FASTSTEP_TEMPLATIZED_REPORT.md` |
+| an MPC loop that **narrows to a sliding window** each cycle | re-solve the window on the warm path, no structural rebuild | **`FastStepHighs`** row masks + variable fixes | `bench/MPC_NARROW_REPORT.md` |
 | an all-vector model you mutate between solves | warm re-solve driven by columnar mutation | **`VectorPersistentHighs`** | `bench/PHASE2_REPORT.md` |
 | a convex-quadratic **objective** (`c·x + ½·xᵀQx`) | build & solve it array-native | `VectorObjective(quadratic=Q)` or `highs_fastload` | `bench/QUADRATIC_QP_REPORT.md` |
 
@@ -232,6 +233,56 @@ stepper.solve(param_values=P, dirty=mask)        # only the changed parameters' 
 constraint matrix `A` is treated as static (see the guard/fold knobs below).
 **When it wins:** **2.33× at the 1e5-nnz class** (3.39× at 1e4) vs the persistent
 APPSI HiGHS interface, clearing the ≥1.4× target with margin (`bench/PHASE4_REPORT.md`).
+
+### Narrow the active window without a rebuild — masked warm updates
+
+A rolling-horizon MPC often re-solves over a **sliding window** of the horizon:
+each cycle only a window `[a, b)` is active, with the state at the window's edge
+held at the current measurement. Narrowing the model structurally (a fresh,
+smaller matrix each cycle) throws away the warm basis and re-pays construction —
+and is exactly the row/column change `FastStepHighs`' fingerprint rejects.
+
+Instead, keep the full matrix and narrow with a **solver-side overlay**: mask the
+out-of-window rows off (relaxed to free, so they impose nothing) and fix the
+out-of-window variables to their boundary values. On the active window this is
+*provably* the structurally-narrowed problem — an in-window recurrence row that
+references a fixed out-of-window variable becomes the correct boundary condition —
+but the matrix (and the fingerprint, the value guard, and the fold set) is
+untouched, so it rides the warm path.
+
+```python
+import numpy as np
+
+# Precompute once from the static mapping (no data dependence):
+active = np.ones(stepper.active_rows.shape, dtype=bool)      # True == row enforced
+fixed  = np.zeros(stepper.fixed_variables_mask.shape, dtype=bool)
+values = np.zeros_like(stepper.fixed_values)
+# ... mark out-of-window rows inactive and out-of-window cols fixed to their
+#     boundary values (use stepper.row_indices(con) / stepper.column_index(var)) ...
+
+for cycle in horizon:
+    update_params(m, cycle)                                  # roll the data as usual
+    stepper.set_window(active_rows=active, fixed_cols=fixed, fixed_values=values)
+    res = stepper.solve()                                    # warm re-solve, basis kept
+    window_obj = res.incumbent_objective - stepper.masked_objective_constant()
+```
+
+Granular calls exist too — `deactivate_rows(rows)` / `activate_rows(rows)` and
+`fix_variables(cols, values)` / `unfix_variables(cols)` — and `clear_window()`
+restores the full model. The API is **array-first** (plain int / bool arrays) so an
+adapter can drive the window from an external controller with no Pyomo mutation on
+the hot path.
+
+**Objective convention:** `solve()` reports the objective of the *full* model with
+the fixed variables held at their pin values (the honest cost of what was solved).
+That equals the narrowed window problem's objective **plus** the constant cost of
+the fixed variables; `masked_objective_constant()` returns that constant, so
+`reported − constant` is the pure in-window cost.
+
+**When it wins:** one masked-warm narrow+solve cycle is **4–8× faster** than a fresh
+structural narrow (a per-cycle APPSI build+solve), and **2.0–2.9×** faster than even
+a fresh `highs_fastload` compile+solve, at the day-length and 1e5-nonzero classes,
+with the window objective equal every cycle (`bench/MPC_NARROW_REPORT.md`).
 
 ### Composing with the construction switch (`vectorized_construction()`)
 
