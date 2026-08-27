@@ -842,7 +842,25 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
     can *verify the values* rather than *trust the mutability flag*.  See the
     module docstring's "Value-aware static-matrix guard" section.
     """
-    col_of = {id(v): j for j, v in enumerate(compiled.columns)}
+    # Column resolver: classic columns are keyed by ``id(VarData)``; a *columnar*
+    # Var contributes ``None`` column entries whose columns come from
+    # ``column_scatter`` (keyed by ``(id(component), position)``), so a
+    # materialized columnar VarData resolves through its ``_pos``.
+    col_of = {id(v): j for j, v in enumerate(compiled.columns) if v is not None}
+    scatter_of = {}
+    for _comp, _solver_cols, _positions in compiled.column_scatter or ():
+        _cid = id(_comp)
+        for _j, _pos in zip(_solver_cols.tolist(), _positions.tolist()):
+            scatter_of[(_cid, _pos)] = _j
+
+    def _resolve_col(v):
+        j = col_of.get(id(v))
+        if j is not None:
+            return j
+        pos = getattr(v, '_pos', None)
+        if pos is not None:
+            return scatter_of.get((id(v.parent_component()), pos))
+        return None
 
     # id(constraint) -> the A-row index/indices it maps to (a range row splits
     # into two rows that share one body, so both carry the same coefficients).
@@ -873,7 +891,7 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
                     "higher-order nonlinear terms."
                 )
             for coef, v in zip(repn.linear_coefs, repn.linear_vars):
-                j = col_of.get(id(v))
+                j = _resolve_col(v)
                 if j is None:
                     raise IncompatibleModelError(
                         f"The '{FastStepHighs.name}' warm interface could not map an "
@@ -916,7 +934,7 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
             # guard (one entry per A-row the constraint occupies -- a range row
             # occupies two, both with the same body coefficients).
             for coef, v in zip(repn.linear_coefs, repn.linear_vars):
-                j = col_of.get(id(v))
+                j = _resolve_col(v)
                 if j is not None and not is_constant(coef):
                     for ri in con_rows[cid]:
                         mat_rows.append(ri)

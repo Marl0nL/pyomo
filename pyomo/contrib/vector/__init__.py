@@ -111,6 +111,18 @@ from pyomo.contrib.vector.template_vectorize import (
     NotVectorizable,
 )
 
+# Transparent columnar Var/Param construction under the same Phase-3 switch: a
+# classic ``Var(index, ...)`` / ``Param(index, ...)`` with vectorizable arguments
+# is built into NumPy columns (materialize-on-touch), skipping the per-index data
+# object; genuinely per-index callables fall back to byte-classic construction.
+from pyomo.contrib.vector.varparam import (
+    TransparentVectorVar,
+    TransparentVectorParam,
+    VectorParamData,
+    is_columnar_var,
+    is_columnar_param,
+)
+
 # Honour PYOMO_VECTOR_CONSTRUCT=1 at import so setting the environment variable
 # is sufficient to turn the fast path on process-wide (no code change).
 apply_env_templatize()
@@ -149,4 +161,9 @@ __all__ = [
     'compile_templated_to_highs_arrays',
     'extract_family',
     'NotVectorizable',
+    'TransparentVectorVar',
+    'TransparentVectorParam',
+    'VectorParamData',
+    'is_columnar_var',
+    'is_columnar_param',
 ]

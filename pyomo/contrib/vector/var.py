@@ -83,9 +83,14 @@ class VectorVarData(VarData):
 
     __slots__ = ('_pos',)
 
-    def __init__(self, component, pos):
+    def __init__(self, component, pos=None):
         # Inlined ComponentData / VarData constructor: we set only the two
         # genuine slots (_component, _pos); every other "slot" is a property.
+        # ``pos`` defaults to None so that a *probe* instantiation with only the
+        # component -- as ``GetItemExpression.__new__`` does to classify a
+        # template getitem as (potentially-variable) numeric vs structural --
+        # succeeds; a probe never touches the columnar arrays, so no position is
+        # needed.  Every real materialization passes an explicit position.
         self._component = weakref_ref(component) if component is not None else None
         self._index = NOTSET
         self._pos = pos
@@ -156,93 +161,32 @@ class VectorVarData(VarData):
             )
 
 
-class VectorVar(IndexedComponent):
-    """A columnar (array-backed) indexed variable.
+class _ColumnarVarMixin:
+    """Shared columnar (array-backed) storage + materialize-on-touch behaviour.
 
-    Parameters
-    ----------
-    *args :
-        One or more Pyomo Sets giving the index (as for a classic ``Var``).
-    domain : Set
-        The (homogeneous) domain shared by every entry.  Default ``Reals``.
-    bounds : tuple, optional
-        ``(lower, upper)``.  Each of ``lower``/``upper`` may be ``None``, a
-        scalar (broadcast to all entries), or a length-N array/sequence.
-    initialize : scalar or array, optional
-        Initial value(s).
+    Mixed into both :class:`VectorVar` (the explicit Phase-1 component) and
+    :class:`~pyomo.contrib.vector.varparam.TransparentVectorVar` (the
+    Phase-3-switch *transparent* construction of a classic ``Var``).  The two
+    differ only in how their columnar arrays are populated at construct time
+    (``VectorVar`` from its own ``bounds=``/``initialize=`` args; the transparent
+    one from a classic ``Var``'s already-parsed initializers), so everything that
+    reads those arrays -- materialize-on-touch, scalarization, the fast-path
+    accessors, and the Phase-2 bulk-mutation / dirty-tracking API -- lives here,
+    once.  A concrete class must define ``construct`` to populate ``_lb_arr``,
+    ``_ub_arr``, ``_value_arr``, ``_fixed_arr``, ``_domain``, ``_n``, and
+    initialise the lazy-map (``_index_order``/``_pos_of``/``_scalarized``/
+    ``_scalarizing``) and dirty-tracking (``_dirty_bounds``) slots this mixin
+    reads.
+
+    The four scalarization entry points call ``IndexedComponent`` explicitly
+    (rather than a zero-argument ``super()``) so that the whole set of methods
+    can be *grafted* onto a plain ``IndexedVar`` subclass
+    (:class:`~pyomo.contrib.vector.varparam.TransparentVectorVar`) without the
+    mixin appearing in that subclass's MRO -- keeping that subclass reachable by
+    a live ``__class__`` swap from a classic ``IndexedVar``.
     """
 
     _ComponentDataClass = VectorVarData
-
-    def __init__(self, *args, **kwargs):
-        domain = kwargs.pop('domain', None)
-        within = kwargs.pop('within', None)
-        self._domain_init = SetInitializer(
-            domain if domain is not None else (within if within is not None else Reals)
-        )
-        self._bounds_arg = kwargs.pop('bounds', None)
-        self._init_arg = kwargs.pop('initialize', None)
-        self._units = kwargs.pop('units', None)
-        if self._units is not None:
-            self._units = units.get_units(self._units)
-        kwargs.setdefault('ctype', Var)
-        IndexedComponent.__init__(self, *args, **kwargs)
-
-        # Populated at construct():
-        self._domain = None
-        self._n = 0
-        self._lb_arr = None
-        self._ub_arr = None
-        self._value_arr = None
-        self._fixed_arr = None
-        # Lazily built (only on scalar access / scalarization):
-        self._index_order = None  # list: position -> index
-        self._pos_of = None  # dict: index -> position
-        self._scalarized = False
-        self._scalarizing = False
-        # Dirty-column tracking for the persistent (warm) re-solve path: the set
-        # of positions whose effective column bounds (explicit bound, fixed flag,
-        # or a fixed entry's value) changed since the last ``pop_dirty_bounds``.
-        # ``None`` means "everything is dirty" (e.g. a freshly (re)constructed
-        # component); an empty set means "nothing changed since last sync".
-        self._dirty_bounds = None
-
-    # ------------------------------------------------------------------ #
-    # Construction
-    # ------------------------------------------------------------------ #
-    def construct(self, data=None):
-        if self._constructed:
-            return
-        self._constructed = True
-        if self._anonymous_sets is not None:
-            for _set in self._anonymous_sets:
-                _set.construct()
-
-        self._domain = self._domain_init(self.parent_block(), None, self)
-        n = self._n = len(self._index_set)
-
-        def _as_array(val, default):
-            if val is None:
-                return np.full(n, default, dtype=np.float64)
-            arr = np.asarray(val, dtype=np.float64)
-            if arr.ndim == 0:
-                return np.full(n, float(arr), dtype=np.float64)
-            if arr.shape != (n,):
-                raise ValueError(
-                    f"VectorVar '{self.name}': bound/initialize array has shape "
-                    f"{arr.shape}, expected ({n},)"
-                )
-            return arr.copy()
-
-        lb = ub = None
-        if self._bounds_arg is not None:
-            lb, ub = self._bounds_arg
-        # Explicit bounds stored with NaN == "no explicit bound" (matches the
-        # classic VarData _lb/_ub is None semantics).
-        self._lb_arr = _as_array(lb, np.nan)
-        self._ub_arr = _as_array(ub, np.nan)
-        self._value_arr = _as_array(self._init_arg, np.nan)
-        self._fixed_arr = np.zeros(n, dtype=bool)
 
     # ------------------------------------------------------------------ #
     # Position mapping (built lazily -- the fast path never needs it)
@@ -489,23 +433,21 @@ class VectorVar(IndexedComponent):
 
     def values(self, *args, **kwargs):
         self._scalarize()
-        return super().values(*args, **kwargs)
+        return IndexedComponent.values(self, *args, **kwargs)
 
     def items(self, *args, **kwargs):
         self._scalarize()
-        return super().items(*args, **kwargs)
+        return IndexedComponent.items(self, *args, **kwargs)
 
     def keys(self, *args, **kwargs):
         self._scalarize()
-        return super().keys(*args, **kwargs)
+        return IndexedComponent.keys(self, *args, **kwargs)
 
     def __iter__(self):
         self._scalarize()
-        return super().__iter__()
+        return IndexedComponent.__iter__(self)
 
     def _pprint(self):
-        from pyomo.core.base.var import value as _value
-
         headers = [
             ("Size", self._n),
             ("Index", self._index_set if self.is_indexed() else None),
@@ -514,3 +456,90 @@ class VectorVar(IndexedComponent):
             ("Scalarized", self._scalarized),
         ]
         return (headers, (), None, None)
+
+
+class VectorVar(_ColumnarVarMixin, IndexedComponent):
+    """A columnar (array-backed) indexed variable.
+
+    Parameters
+    ----------
+    *args :
+        One or more Pyomo Sets giving the index (as for a classic ``Var``).
+    domain : Set
+        The (homogeneous) domain shared by every entry.  Default ``Reals``.
+    bounds : tuple, optional
+        ``(lower, upper)``.  Each of ``lower``/``upper`` may be ``None``, a
+        scalar (broadcast to all entries), or a length-N array/sequence.
+    initialize : scalar or array, optional
+        Initial value(s).
+    """
+
+    def __init__(self, *args, **kwargs):
+        domain = kwargs.pop('domain', None)
+        within = kwargs.pop('within', None)
+        self._domain_init = SetInitializer(
+            domain if domain is not None else (within if within is not None else Reals)
+        )
+        self._bounds_arg = kwargs.pop('bounds', None)
+        self._init_arg = kwargs.pop('initialize', None)
+        self._units = kwargs.pop('units', None)
+        if self._units is not None:
+            self._units = units.get_units(self._units)
+        kwargs.setdefault('ctype', Var)
+        IndexedComponent.__init__(self, *args, **kwargs)
+
+        # Populated at construct():
+        self._domain = None
+        self._n = 0
+        self._lb_arr = None
+        self._ub_arr = None
+        self._value_arr = None
+        self._fixed_arr = None
+        # Lazily built (only on scalar access / scalarization):
+        self._index_order = None  # list: position -> index
+        self._pos_of = None  # dict: index -> position
+        self._scalarized = False
+        self._scalarizing = False
+        # Dirty-column tracking for the persistent (warm) re-solve path: the set
+        # of positions whose effective column bounds (explicit bound, fixed flag,
+        # or a fixed entry's value) changed since the last ``pop_dirty_bounds``.
+        # ``None`` means "everything is dirty" (e.g. a freshly (re)constructed
+        # component); an empty set means "nothing changed since last sync".
+        self._dirty_bounds = None
+
+    # ------------------------------------------------------------------ #
+    # Construction
+    # ------------------------------------------------------------------ #
+    def construct(self, data=None):
+        if self._constructed:
+            return
+        self._constructed = True
+        if self._anonymous_sets is not None:
+            for _set in self._anonymous_sets:
+                _set.construct()
+
+        self._domain = self._domain_init(self.parent_block(), None, self)
+        n = self._n = len(self._index_set)
+
+        def _as_array(val, default):
+            if val is None:
+                return np.full(n, default, dtype=np.float64)
+            arr = np.asarray(val, dtype=np.float64)
+            if arr.ndim == 0:
+                return np.full(n, float(arr), dtype=np.float64)
+            if arr.shape != (n,):
+                raise ValueError(
+                    f"VectorVar '{self.name}': bound/initialize array has shape "
+                    f"{arr.shape}, expected ({n},)"
+                )
+            return arr.copy()
+
+        lb = ub = None
+        if self._bounds_arg is not None:
+            lb, ub = self._bounds_arg
+        # Explicit bounds stored with NaN == "no explicit bound" (matches the
+        # classic VarData _lb/_ub is None semantics).
+        self._lb_arr = _as_array(lb, np.nan)
+        self._ub_arr = _as_array(ub, np.nan)
+        self._value_arr = _as_array(self._init_arg, np.nan)
+        self._fixed_arr = np.zeros(n, dtype=bool)

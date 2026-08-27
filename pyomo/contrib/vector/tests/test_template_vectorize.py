@@ -176,7 +176,16 @@ def _range_rows_from_stock(info):
 def _range_rows_from_compiled(compiled):
     A = compiled.A.tocsr()
     cols = compiled.columns
-    keys = [(v.parent_component().local_name, v.index()) for v in cols]
+    # A columnar Var contributes ``None`` column entries (its solution is mapped
+    # back in bulk via ``column_scatter``); recover their (component, index)
+    # identity from that structure so the matrix signature is comparable.
+    keys = [
+        (v.parent_component().local_name, v.index()) if v is not None else None
+        for v in cols
+    ]
+    for comp, solver_cols, positions in compiled.column_scatter or []:
+        for j, pos in zip(solver_cols.tolist(), positions.tolist()):
+            keys[j] = (comp.local_name, comp.index_at(pos))
     rows = []
     for i in range(A.shape[0]):
         s, e = A.indptr[i], A.indptr[i + 1]

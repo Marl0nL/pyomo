@@ -56,6 +56,7 @@ def _pyomo_models() -> Dict[str, Any]:
         facility_location,
         supply_chain,
         resource_coupling,
+        columnar_stress,
     )
 
     reg = {
@@ -64,6 +65,7 @@ def _pyomo_models() -> Dict[str, Any]:
         "facility_location": facility_location,
         "supply_chain": supply_chain,
         "resource_coupling": resource_coupling,
+        "columnar_stress": columnar_stress,
     }
     return reg
 
@@ -99,6 +101,7 @@ PYOMO_MODEL_NAMES = [
     "facility_location_q",
     "supply_chain",
     "resource_coupling",
+    "columnar_stress",
 ]
 
 COMPARATOR_MODEL_NAMES = ["network_flow", "facility_location"]
@@ -112,6 +115,7 @@ VECTOR_MODEL_NAMES = ["network_flow", "supply_chain"]
 # fast-path win and the no-slowdown-on-fallback guarantee are on the record.
 TEMPLATE_MODEL_NAMES = [
     "resource_coupling",
+    "columnar_stress",
     "facility_location",
     "network_flow",
     "unit_commitment",
