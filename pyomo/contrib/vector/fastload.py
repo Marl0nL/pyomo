@@ -108,6 +108,10 @@ class FastLoadCompiled:
     columns : list[VarData]                  -- one per column of A (map-back)
     rows : list[(ConstraintData, int)]       -- one per row; int is the
         standard-form row multiplier (0 == equality, 1 == upper, -1 == lower)
+    hessian : scipy.sparse.csc_array | None  -- lower-triangular objective
+        Hessian (``0.5 x'H x``) over the column space, or None for a pure-linear
+        objective.  Carries the true objective sign (the HiGHS sense is set
+        directly, so no cost/Hessian negation for a maximize objective).
     """
 
     __slots__ = (
@@ -123,6 +127,7 @@ class FastLoadCompiled:
         'has_objective',
         'columns',
         'rows',
+        'hessian',
     )
 
     def __init__(
@@ -139,6 +144,7 @@ class FastLoadCompiled:
         has_objective,
         columns,
         rows,
+        hessian=None,
     ):
         self.A = A
         self.row_lower = row_lower
@@ -152,6 +158,7 @@ class FastLoadCompiled:
         self.has_objective = has_objective
         self.columns = columns
         self.rows = rows
+        self.hessian = hessian
 
     @property
     def n_col(self):
@@ -164,6 +171,10 @@ class FastLoadCompiled:
     @property
     def nnz(self):
         return int(self.A.nnz)
+
+    @property
+    def is_quadratic(self):
+        return self.hessian is not None and self.hessian.nnz > 0
 
 
 def compile_to_highs_arrays(model):
@@ -192,6 +203,15 @@ def compile_to_highs_arrays(model):
 
     if model_has_templates(model):
         return compile_templated_to_highs_arrays(model)
+
+    # A convex-quadratic *objective* (constraints stay linear) takes a dedicated
+    # route: the stock LinearStandardFormCompiler is linear-only and rejects a
+    # quadratic objective, so we compile the linear part (constraints + column
+    # space) with the objective set aside and add the objective's Hessian over
+    # the same column space (the #1761 use case, objective-quadratic only).
+    quad = _quadratic_objective_repn(model)
+    if quad is not None:
+        return _compile_quadratic_objective(model, *quad)
 
     from pyomo.repn.plugins.standard_form import LinearStandardFormCompiler
     from pyomo.common.errors import InvalidConstraintError, InvalidExpressionError
@@ -276,6 +296,164 @@ def compile_to_highs_arrays(model):
     )
 
 
+def _quadratic_objective_repn(model):
+    """Return ``(obj, qrepn)`` if the single active objective is quadratic, else
+    ``None``.
+
+    ``None`` is returned for a linear objective (the standard route handles it),
+    for no objective, and for a genuinely higher-order nonlinear objective (the
+    standard route rejects it loudly).  Multiple objectives fall through to the
+    standard route's single-objective guard.
+    """
+    from pyomo.core.base.objective import Objective
+    from pyomo.repn.standard_repn import generate_standard_repn
+
+    objs = [
+        o
+        for o in model.component_data_objects(Objective, active=True, descend_into=True)
+    ]
+    if len(objs) != 1:
+        return None
+    obj = objs[0]
+    qrepn = generate_standard_repn(obj.expr, quadratic=True)
+    if not qrepn.is_quadratic():
+        return None
+    return obj, qrepn
+
+
+def _compile_quadratic_objective(model, obj, qrepn):
+    """Compile a model whose objective is convex-quadratic (constraints linear).
+
+    The constraints and their column space come from the stock
+    :class:`LinearStandardFormCompiler` (the objective set aside so it does not
+    reject the quadratic term); the objective's linear cost and Hessian are then
+    added over that same column space, extended with any objective-only
+    variables the constraints did not already contribute.
+    """
+    from pyomo.common.dependencies import scipy
+    from pyomo.repn.plugins.standard_form import LinearStandardFormCompiler
+    from pyomo.common.errors import InvalidConstraintError, InvalidExpressionError
+
+    # --- constraints + column space (objective temporarily deactivated) ------ #
+    was_active = obj.active
+    obj.deactivate()
+    try:
+        info = LinearStandardFormCompiler().write(
+            model, mixed_form=True, set_sense=None
+        )
+    except (InvalidConstraintError, InvalidExpressionError) as e:
+        raise IncompatibleModelError(
+            f"The '{FastLoadHighs.name}' fast solver hand-off supports a quadratic "
+            "objective only with linear constraints; this model has a nonlinear "
+            f"constraint the standard-form compiler cannot process ({e}).  Use a "
+            "classic nonlinear solver route (e.g. SolverFactory('ipopt'))."
+        ) from e
+    except ValueError as e:
+        raise IncompatibleModelError(
+            f"The '{FastLoadHighs.name}' fast solver hand-off cannot compile this "
+            f"model to standard form: {e}  Use a classic solver route."
+        ) from e
+    finally:
+        if was_active:
+            obj.activate()
+
+    columns = list(info.columns)
+    col_of = {id(v): j for j, v in enumerate(columns)}
+    A = info.A.tocsc()
+
+    # --- extend the column space with objective-only variables --------------- #
+    extra = []
+    for v in list(qrepn.linear_vars) + [v for pair in qrepn.quadratic_vars for v in pair]:
+        if id(v) not in col_of:
+            col_of[id(v)] = len(columns)
+            columns.append(v)
+            extra.append(v)
+    n_col = len(columns)
+    if extra:
+        # Append empty columns to A (they carry no constraint coefficients).
+        A = scipy.sparse.hstack(
+            [A, scipy.sparse.csc_array((A.shape[0], len(extra)))], format='csc'
+        )
+
+    # --- column bounds + integrality ----------------------------------------- #
+    col_lower = np.empty(n_col, dtype=np.float64)
+    col_upper = np.empty(n_col, dtype=np.float64)
+    integrality = np.zeros(n_col, dtype=bool)
+    for j, v in enumerate(columns):
+        lb, ub = v.bounds
+        col_lower[j] = _ninf_none(lb)
+        col_upper[j] = _pinf_none(ub)
+        if not v.is_continuous():
+            integrality[j] = True
+
+    # --- range rows (identical to the linear route) -------------------------- #
+    rows = info.rows
+    n_row = len(rows)
+    rhs = np.asarray(info.rhs, dtype=np.float64)
+    bt = np.fromiter((r[1] for r in rows), dtype=np.int8, count=n_row)
+    row_lower = np.where(bt == 1, -_inf, rhs)
+    row_upper = np.where(bt == -1, _inf, rhs)
+
+    # --- objective: linear cost + Hessian over the column space -------------- #
+    c = np.zeros(n_col, dtype=np.float64)
+    for coef, v in zip(qrepn.linear_coefs, qrepn.linear_vars):
+        c[col_of[id(v)]] += float(coef)
+    hessian = _quadratic_repn_to_hessian(qrepn, col_of, n_col)
+    sense = ObjectiveSense(obj.sense)
+    c_offset = float(qrepn.constant)
+
+    return FastLoadCompiled(
+        A,
+        row_lower,
+        row_upper,
+        col_lower,
+        col_upper,
+        integrality,
+        c,
+        c_offset,
+        sense,
+        True,
+        columns,
+        list(rows),
+        hessian,
+    )
+
+
+def _quadratic_repn_to_hessian(qrepn, col_of, n_col):
+    """Build the lower-triangular CSC Hessian from a quadratic standard repn.
+
+    ``generate_standard_repn`` yields monomial coefficients: a diagonal term
+    ``coef * x_i^2`` maps to Hessian ``H_ii = 2*coef``; an off-diagonal
+    ``coef * x_i * x_j`` (each unordered pair once) maps to ``H_ij = coef``,
+    stored once in the lower triangle (``0.5 x'H x`` symmetrizes it).
+    """
+    from pyomo.common.dependencies import scipy
+
+    rows, cols, data = [], [], []
+    for (va, vb), coef in zip(qrepn.quadratic_vars, qrepn.quadratic_coefs):
+        ja = col_of[id(va)]
+        jb = col_of[id(vb)]
+        if ja == jb:
+            rows.append(ja)
+            cols.append(ja)
+            data.append(2.0 * float(coef))
+        else:
+            r, cc = (ja, jb) if ja > jb else (jb, ja)  # lower triangle
+            rows.append(r)
+            cols.append(cc)
+            data.append(float(coef))
+    if not rows:
+        return None
+    H = scipy.sparse.coo_matrix(
+        (np.asarray(data, dtype=np.float64), (np.asarray(rows), np.asarray(cols))),
+        shape=(n_col, n_col),
+    ).tocsc()
+    H.sum_duplicates()
+    H.sort_indices()
+    H.eliminate_zeros()
+    return H
+
+
 def _ninf_none(v):
     return -_inf if v is None else float(v)
 
@@ -322,6 +500,38 @@ def build_highs_lp(compiled: FastLoadCompiled):
             for flag in compiled.integrality
         ]
     return lp
+
+
+def build_highs_model(compiled: FastLoadCompiled):
+    """Build a ``highspy`` model object for ``passModel``.
+
+    Returns a bare ``HighsLp`` for a linear model, or a ``HighsModel`` carrying
+    both the LP and the objective Hessian for a convex-QP model.  A MIQP
+    (integer variable + quadratic objective) is rejected loudly -- HiGHS cannot
+    solve MIQP (verified empirically), so the fast path never mis-solves it.
+    """
+    import highspy
+
+    lp = build_highs_lp(compiled)
+    if not compiled.is_quadratic:
+        return lp
+    if compiled.integrality.any():
+        raise IncompatibleModelError(
+            f"The '{FastLoadHighs.name}' fast solver hand-off received a quadratic "
+            "objective together with integer/binary variables (MIQP).  HiGHS "
+            "cannot solve MIQP problems; use a MIQP-capable solver (e.g. Gurobi)."
+        )
+    H = compiled.hessian
+    hess = highspy.HighsHessian()
+    hess.dim_ = compiled.n_col
+    hess.format_ = highspy.HessianFormat.kTriangular
+    hess.start_ = H.indptr.astype(np.int32)
+    hess.index_ = H.indices.astype(np.int32)
+    hess.value_ = H.data.astype(np.float64)
+    model = highspy.HighsModel()
+    model.lp_ = lp
+    model.hessian_ = hess
+    return model
 
 
 # --------------------------------------------------------------------------- #
@@ -480,7 +690,7 @@ class FastLoadHighs(SolverBase):
             with capture_output(TeeStream(*ostreams), capture_fd=True):
                 timer.start('compile')
                 compiled = compile_to_highs_arrays(model)
-                lp = build_highs_lp(compiled)
+                lp = build_highs_model(compiled)
                 timer.stop('compile')
 
                 highs = highspy.Highs()
@@ -501,8 +711,22 @@ class FastLoadHighs(SolverBase):
                 timer.stop('load')
 
                 timer.start('optimize')
-                highs.run()
+                run_status = highs.run()
                 timer.stop('optimize')
+
+                # HiGHS solves convex QP only: a non-convex (non-PSD) objective
+                # Hessian is refused at run time (HighsStatus.kError, model status
+                # kNotset).  Surface it clearly instead of reporting a bogus
+                # status -- the captured solver log names the offending Hessian.
+                if compiled.is_quadratic and str(run_status) != 'HighsStatus.kOk':
+                    raise IncompatibleModelError(
+                        f"The '{self.name}' fast solver hand-off could not solve "
+                        f"the quadratic objective (HiGHS run status {run_status}, "
+                        f"model status {highs.getModelStatus()}).  HiGHS solves "
+                        "convex QP only: for a minimize objective the Hessian "
+                        "must be positive semidefinite (negative semidefinite for "
+                        "maximize).  See the solver log for the offending term."
+                    )
 
             results = self._postsolve(highs, compiled, model, config)
         except InfeasibleConstraintException as err:

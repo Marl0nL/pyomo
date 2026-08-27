@@ -71,7 +71,7 @@ class VectorMatrices:
 
     def __init__(self, n_var, col_lower, col_upper, integrality, col_value,
                  col_fixed, A, row_lower, row_upper, c, c_offset, sense,
-                 var_blocks, row_blocks):
+                 var_blocks, row_blocks, hessian=None):
         self.n_var = n_var
         self.col_lower = col_lower
         self.col_upper = col_upper
@@ -86,6 +86,15 @@ class VectorMatrices:
         self.sense = sense
         self.var_blocks = var_blocks
         self.row_blocks = row_blocks
+        # Lower-triangular CSC of the full symmetric objective Hessian H
+        # (``0.5 x'H x``) over the global column space, or None for a pure-linear
+        # objective.  Sign is the true (unflipped) objective; the solver hand-off
+        # flips it for a maximize objective.
+        self.hessian = hessian
+
+    @property
+    def is_quadratic(self):
+        return self.hessian is not None and self.hessian.nnz > 0
 
     @property
     def n_row(self):
@@ -224,6 +233,7 @@ def assemble(model):
     c = np.zeros(n_var, dtype=np.float64)
     c_offset = 0.0
     sense = ObjectiveSense.minimize
+    hessian = None
     if vobjs:
         if len(vobjs) > 1:
             raise VectorPathDisabledError("Multiple objectives are not supported.")
@@ -233,11 +243,53 @@ def assemble(model):
             c[o:o + v.n] += arr
         c_offset = obj.constant
         sense = obj.sense
+        if obj.is_quadratic():
+            hessian = _assemble_hessian(obj, offset_of, n_var)
 
     return VectorMatrices(
         n_var, col_lower, col_upper, integrality, col_value, col_fixed,
         A, row_lower, row_upper, c, c_offset, sense, var_blocks, row_blocks,
+        hessian,
     )
+
+
+def _assemble_hessian(obj, offset_of, n_var):
+    """Assemble the lower-triangular CSC Hessian for ``0.5 x'H x`` over globals.
+
+    Each ``(vrow, vcol, block)`` term contributes to the full symmetric Hessian:
+    a diagonal block ``(v, v)`` its symmetrized sub-block; an off-diagonal
+    ``(vi, vj)`` the coupling ``block`` at ``(vi, vj)`` plus its transpose at
+    ``(vj, vi)``.  Only the lower triangle is returned (the HiGHS format).
+    """
+    rows, cols, data = [], [], []
+    for vr, vc, B in obj.quadratic_terms:
+        orr = offset_of[id(vr)]
+        occ = offset_of[id(vc)]
+        if vr is vc:
+            Bsym = (B + B.transpose()) * 0.5
+            coo = Bsym.tocoo()
+            rows.append(coo.row + orr)
+            cols.append(coo.col + occ)
+            data.append(coo.data)
+        else:
+            coo = B.tocoo()
+            rows.append(coo.row + orr)
+            cols.append(coo.col + occ)
+            data.append(coo.data)
+            rows.append(coo.col + occ)
+            cols.append(coo.row + orr)
+            data.append(coo.data)
+    if not rows:
+        return None
+    r = np.concatenate(rows)
+    c = np.concatenate(cols)
+    d = np.concatenate(data)
+    H = scipy.sparse.coo_matrix((d, (r, c)), shape=(n_var, n_var)).tocsr()
+    H.sum_duplicates()
+    Hl = scipy.sparse.tril(H).tocsc()
+    Hl.sort_indices()
+    Hl.eliminate_zeros()
+    return Hl
 
 
 # --------------------------------------------------------------------------- #

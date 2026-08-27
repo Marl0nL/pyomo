@@ -18,10 +18,13 @@ Phase 1 -- explicit columnar components:
   (materialize-on-touch).
 * :class:`VectorConstraint` -- an explicit-array linear constraint family
   (``VectorConstraint(A=csr, x=..., lb=..., ub=...)``).
-* :class:`VectorObjective` -- a linear objective stored as coefficient arrays.
+* :class:`VectorObjective` -- a linear (or convex-quadratic) objective stored as
+  coefficient arrays plus an optional sparse Hessian (``c @ x + 0.5 * x @ Q @ x``,
+  the #1761 use case).
 * :func:`compile_standard_form` -- splice the vector components into a standard
   form comparable to :class:`~pyomo.repn.plugins.standard_form.LinearStandardFormCompiler`.
-* :func:`load_highs` -- direct ``Highs.passModel`` array hand-off (the load prize).
+* :func:`load_highs` -- direct ``Highs.passModel`` array hand-off (the load
+  prize); passes the objective Hessian for a convex-QP model.
 
 Phase 2 -- transparent fast solver hand-off for unmodified classic models:
 
@@ -61,7 +64,13 @@ from pyomo.contrib.vector.matrices import (
     VectorStandardFormInfo,
     VectorPathDisabledError,
 )
-from pyomo.contrib.vector.highs import load_highs, solve_highs, matrices_to_highs_lp
+from pyomo.contrib.vector.highs import (
+    load_highs,
+    solve_highs,
+    matrices_to_highs_lp,
+    matrices_to_highs_model,
+    QuadraticModelError,
+)
 
 # Importing fastload registers the ``highs_fastload`` solver with both the v2
 # and legacy SolverFactory (the transparent classic-model fast hand-off).
@@ -69,6 +78,7 @@ from pyomo.contrib.vector.fastload import (
     FastLoadHighs,
     compile_to_highs_arrays,
     build_highs_lp,
+    build_highs_model,
 )
 
 # Phase 4 -- array-native persistent warm re-solve for the rolling-horizon path.
@@ -104,9 +114,12 @@ __all__ = [
     'load_highs',
     'solve_highs',
     'matrices_to_highs_lp',
+    'matrices_to_highs_model',
+    'QuadraticModelError',
     'FastLoadHighs',
     'compile_to_highs_arrays',
     'build_highs_lp',
+    'build_highs_model',
     'FastStepHighs',
     'vectorized_construction',
     'templatize_enabled_by_env',

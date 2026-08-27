@@ -50,14 +50,19 @@ def matrices_to_highs_lp(mx: VectorMatrices):
     A = mx.A.tocsc()
 
     c = mx.c.astype(np.float64)
-    if str(mx.sense) == 'maximize' or int(mx.sense) == -1:
-        # HiGHS minimizes; flip a maximize objective.
-        c = -c
+    maximize = str(mx.sense) == 'maximize' or int(mx.sense) == -1
 
     lp = highspy.HighsLp()
     lp.num_col_ = mx.n_var
     lp.num_row_ = mx.n_row
     lp.col_cost_ = c
+    # Tell HiGHS the sense directly (rather than negating the cost), so it reports
+    # the true objective and -- for a QP -- checks convexity for the right sense
+    # (concave Hessian for maximize).
+    lp.sense_ = (
+        highspy.ObjSense.kMaximize if maximize else highspy.ObjSense.kMinimize
+    )
+    lp.offset_ = float(mx.c_offset)
     lp.col_lower_ = col_lower
     lp.col_upper_ = col_upper
     lp.row_lower_ = row_lower
@@ -78,24 +83,91 @@ def matrices_to_highs_lp(mx: VectorMatrices):
     return lp
 
 
+class QuadraticModelError(Exception):
+    """Raised when a quadratic model cannot be handed to HiGHS (MIQP / etc.)."""
+
+
+def _hessian_to_highs(Hl, n_var):
+    """Build a ``highspy.HighsHessian`` from a lower-triangular CSC Hessian.
+
+    The Hessian carries the true objective sign; ``matrices_to_highs_lp`` sets
+    ``lp.sense_`` (rather than negating the cost), so HiGHS applies the sense to
+    both the linear and quadratic parts and checks convexity for that sense.
+    """
+    import highspy
+
+    hess = highspy.HighsHessian()
+    hess.dim_ = n_var
+    hess.format_ = highspy.HessianFormat.kTriangular
+    hess.start_ = Hl.indptr.astype(np.int32)
+    hess.index_ = Hl.indices.astype(np.int32)
+    hess.value_ = Hl.data.astype(np.float64)
+    return hess
+
+
+def matrices_to_highs_model(mx: VectorMatrices):
+    """Build a ``highspy`` model object to feed ``passModel``.
+
+    Returns a bare ``HighsLp`` for a linear model, or a ``HighsModel`` carrying
+    both the LP and the objective Hessian for a convex-QP model.  A MIQP
+    (integer variable + quadratic objective) is rejected loudly: HiGHS cannot
+    solve MIQP (verified empirically), so this never silently mis-solves.
+    """
+    import highspy
+
+    lp = matrices_to_highs_lp(mx)
+    if not mx.is_quadratic:
+        return lp
+    if mx.integrality.any():
+        raise QuadraticModelError(
+            "The vector fast path received a quadratic objective together with "
+            "integer/binary variables (MIQP).  HiGHS cannot solve MIQP problems; "
+            "use a MIQP-capable solver (e.g. Gurobi) for this model."
+        )
+    model = highspy.HighsModel()
+    model.lp_ = lp
+    model.hessian_ = _hessian_to_highs(mx.hessian, mx.n_var)
+    return model
+
+
 def load_highs(model):
     """Assemble ``model`` and load it into an in-process HiGHS via ``passModel``.
 
-    Returns the ``highspy.Highs`` instance (model loaded, not solved).
+    Returns the ``highspy.Highs`` instance (model loaded, not solved).  Handles a
+    convex-quadratic :class:`~pyomo.contrib.vector.objective.VectorObjective` by
+    also passing its Hessian.
     """
     import highspy
 
     mx = assemble(model)
-    lp = matrices_to_highs_lp(mx)
+    m = matrices_to_highs_model(mx)
     h = highspy.Highs()
     h.silent()
-    h.passModel(lp)
+    h.passModel(m)
     return h
 
 
 def solve_highs(model):
-    """Convenience: assemble, load, and solve; returns ``(highs, objective)``."""
-    h = load_highs(model)
-    h.run()
+    """Convenience: assemble, load, and solve; returns ``(highs, objective)``.
+
+    A non-convex QP is surfaced clearly: HiGHS refuses a non-PSD Hessian at
+    ``run`` time, which this reports rather than returning a bogus objective.
+    """
+    import highspy
+
+    mx = assemble(model)
+    m = matrices_to_highs_model(mx)
+    h = highspy.Highs()
+    h.silent()
+    h.passModel(m)
+    status = h.run()
+    if mx.is_quadratic and str(status) != 'HighsStatus.kOk':
+        raise QuadraticModelError(
+            "HiGHS could not solve the quadratic model (status "
+            f"{status}, model status {h.getModelStatus()}).  The most common "
+            "cause is a non-convex objective Hessian (HiGHS solves convex QP "
+            "only): for a minimize objective the Hessian must be positive "
+            "semidefinite (negative semidefinite for maximize)."
+        )
     info = h.getInfo()
     return h, info.objective_function_value
