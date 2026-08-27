@@ -12,7 +12,15 @@ This fork carries a phased "Vectorized Model Construction for Pyomo" program und
 relevant one before touching a phase. Phases: 1 columnar components, 2
 `highs_fastload` (cold `passModel` hand-off), 3 template construction, 4
 `highs_faststep` (`FastStepHighs`, array-native persistent **warm** re-solve for
-rolling-horizon / MPC). The whole program is consolidated in two docs: the
+rolling-horizon / MPC). The Phase-3 construction switch (`vectorized_construction()`
+/ `PYOMO_VECTOR_CONSTRUCT`) also does **transparent columnar Var/Param
+construction** (`pyomo/contrib/vector/varparam.py`): a classic `Var`/`Param` with
+vectorizable args builds into NumPy columns (materialize-on-touch), skipping the
+per-index data object; per-index callables fall back to byte-classic. Activation
+is a runtime monkeypatch of `Var.construct`/`Param.construct` — **no `pyomo/core/*`
+edit** — so switch-off is byte-classic. See `bench/VARPARAM_REPORT.md`. Known gap:
+`faststep` over a *templatized* (switch-on) model is a pre-existing Phase-3/4
+incompatibility (templatized `compiled.rows` carry the family, not per-row bodies). The whole program is consolidated in two docs: the
 PEP-style upstream proposal `docs/vector_proposal.md` (design, evidence,
 compatibility contract, `contrib → core` migration split — every number cited from
 a committed `bench/` report) and the user guide `pyomo/contrib/vector/README.md`

@@ -94,9 +94,12 @@ class NotVectorizable(Exception):
 # Activation (opt-in; default OFF)
 # --------------------------------------------------------------------------- #
 def _set_templatize(flag):
-    """Enable/disable the core ``TEMPLATIZE_CONSTRAINTS`` switch.
+    """Enable/disable the Phase-3 construction switch.
 
-    Returns the prior ``(constraint_flag, objective_flag)`` so it can be
+    Drives two things together (both keyed on the same switch): the core
+    ``TEMPLATIZE_CONSTRAINTS`` flag (vectorized *constraint* construction) and
+    the transparent columnar *Var / Param* construction patch
+    (:mod:`pyomo.contrib.vector.varparam`).  Returns the prior state so it can be
     restored.  Phase 3 templatizes **constraints** only -- the "your old code
     gets fast" milestone is about ``Constraint(index, rule=...)`` families.  We
     deliberately leave ``TEMPLATIZE_OBJECTIVES`` off: a scalar ``Objective(expr=
@@ -106,8 +109,13 @@ def _set_templatize(flag):
     """
     import pyomo.core.base.constraint as _con
     import pyomo.core.base.objective as _obj
+    from pyomo.contrib.vector import varparam as _vp
 
-    prior = (_con.TEMPLATIZE_CONSTRAINTS, _obj.TEMPLATIZE_OBJECTIVES)
+    prior = (
+        _con.TEMPLATIZE_CONSTRAINTS,
+        _obj.TEMPLATIZE_OBJECTIVES,
+        _vp.set_varparam_vectorize(bool(flag)),
+    )
     _con.TEMPLATIZE_CONSTRAINTS = flag
     return prior
 
@@ -115,8 +123,10 @@ def _set_templatize(flag):
 def _restore_templatize(prior):
     import pyomo.core.base.constraint as _con
     import pyomo.core.base.objective as _obj
+    from pyomo.contrib.vector import varparam as _vp
 
-    _con.TEMPLATIZE_CONSTRAINTS, _obj.TEMPLATIZE_OBJECTIVES = prior
+    _con.TEMPLATIZE_CONSTRAINTS, _obj.TEMPLATIZE_OBJECTIVES = prior[0], prior[1]
+    _vp.restore_varparam_vectorize(prior[2])
 
 
 class vectorized_construction:
@@ -560,6 +570,19 @@ def _eval_param_getitem(node, row_axis, n):
         keys = dim_arrays[0].tolist()
     else:
         keys = list(zip(*(a.tolist() for a in dim_arrays)))
+    # A columnar Param serves the whole look-up from its value array in bulk --
+    # no per-row ParamData is materialized (keeps the compile array-native).
+    reader = getattr(comp, '_columnar_param_values_at', None)
+    if reader is not None:
+        try:
+            out = np.asarray(reader(keys), dtype=np.float64)
+        except Exception as e:
+            raise NotVectorizable(
+                f"could not evaluate look-up '{comp.name}': {e}"
+            ) from e
+        if np.isnan(out).any():
+            raise NotVectorizable(f"look-up '{comp.name}' has undefined entries")
+        return out
     out = np.empty(n, dtype=np.float64)
     from pyomo.core.expr.numvalue import value as _value
 
@@ -712,17 +735,41 @@ def compile_templated_to_highs_arrays(model):
         off += len(v)
     n_var = off
 
+    from pyomo.contrib.vector.varparam import is_columnar_var
+
     col_lower = np.full(n_var, _ninf)
     col_upper = np.full(n_var, _inf)
     integrality = np.zeros(n_var, dtype=bool)
-    columns = [None] * n_var  # VarData, in column order (solution map-back)
+    columns = [None] * n_var  # classic VarData in column order (None for columnar)
+    fixed = np.zeros(n_var, dtype=bool)
+    fixed_val = np.zeros(n_var, dtype=np.float64)
+    columnar_owners = []  # (component, base, nv) -- bulk map-back after finalize
     for v in var_comps:
         base = col_offset[id(v)]
-        lo, hi, integ, vardata = _var_column_data(v)
-        col_lower[base : base + len(v)] = lo
-        col_upper[base : base + len(v)] = hi
-        integrality[base : base + len(v)] = integ
-        columns[base : base + len(v)] = vardata
+        nv = len(v)
+        if is_columnar_var(v):
+            # Read the whole column's bounds / integrality / fixed state from the
+            # component's NumPy arrays -- no per-index VarData is materialized, so
+            # the construction win survives into the compile ("array-native").
+            lo, hi = v.effective_bounds()
+            col_lower[base : base + nv] = lo
+            col_upper[base : base + nv] = hi
+            integrality[base : base + nv] = v.integrality()
+            fx = np.asarray(v.fixed_array, dtype=bool)
+            fixed[base : base + nv] = fx
+            if fx.any():
+                fixed_val[base : base + nv] = np.where(
+                    fx, np.nan_to_num(v.value_array, nan=0.0), 0.0
+                )
+            columnar_owners.append((v, base, nv))
+        else:
+            lo, hi, integ, vardata, fx, fv = _var_column_data(v)
+            col_lower[base : base + nv] = lo
+            col_upper[base : base + nv] = hi
+            integrality[base : base + nv] = integ
+            columns[base : base + nv] = vardata
+            fixed[base : base + nv] = fx
+            fixed_val[base : base + nv] = fv
 
     # --- objective -------------------------------------------------------- #
     c = np.zeros(n_var, dtype=np.float64)
@@ -792,6 +839,7 @@ def compile_templated_to_highs_arrays(model):
         c,
         c_offset,
         columns,
+        keep_cols,
     ) = _finalize_columns(
         A,
         row_lower,
@@ -802,9 +850,24 @@ def compile_templated_to_highs_arrays(model):
         c,
         c_offset,
         columns,
-        var_comps,
-        col_offset,
+        fixed,
+        fixed_val,
     )
+
+    # --- bulk solution map-back for columnar Var components --------------- #
+    column_scatter = None
+    if columnar_owners:
+        new_index = np.full(n_var, -1, dtype=np.int64)
+        new_index[keep_cols] = np.arange(len(keep_cols), dtype=np.int64)
+        column_scatter = []
+        for comp, base, nv in columnar_owners:
+            solver = new_index[base : base + nv]  # solver col per position (-1=dropped)
+            survive = solver >= 0
+            if survive.any():
+                positions = np.nonzero(survive)[0].astype(np.int64)
+                column_scatter.append((comp, solver[survive], positions))
+        if not column_scatter:
+            column_scatter = None
 
     return FastLoadCompiled(
         A.tocsc(),
@@ -819,20 +882,25 @@ def compile_templated_to_highs_arrays(model):
         has_objective,
         columns,
         rows_meta,
+        column_scatter=column_scatter,
     )
 
 
 def _var_column_data(v):
-    """Return ``(lb, ub, integrality, vardata_list)`` arrays for a Var component.
+    """Return ``(lb, ub, integrality, vardata, fixed, fixed_val)`` for a Var.
 
-    Reads bounds/domain from the (already-constructed classic) per-index VarData
-    in the component's own index order -- these objects exist for a classic Var,
-    so this materializes nothing new.
+    Reads bounds/domain/fixed from the (already-constructed classic) per-index
+    VarData in the component's own index order -- these objects exist for a
+    classic Var, so this materializes nothing new.  A *columnar* Var is read in
+    bulk from its arrays instead (see the compile loop); this per-index path is
+    only for classic Var components.
     """
     n = len(v)
     lo = np.empty(n, dtype=np.float64)
     hi = np.empty(n, dtype=np.float64)
     integ = np.zeros(n, dtype=bool)
+    fixed = np.zeros(n, dtype=bool)
+    fixed_val = np.zeros(n, dtype=np.float64)
     vardata = [None] * n
     for pos, idx in enumerate(v.index_set()):
         vd = v[idx]
@@ -841,8 +909,11 @@ def _var_column_data(v):
         hi[pos] = _inf if b_hi is None else float(b_hi)
         if not vd.is_continuous():
             integ[pos] = True
+        if vd.fixed:
+            fixed[pos] = True
+            fixed_val[pos] = 0.0 if vd.value is None else float(vd.value)
         vardata[pos] = vd
-    return lo, hi, integ, vardata
+    return lo, hi, integ, vardata, fixed, fixed_val
 
 
 def _objective_cost(obj, obj_data, c, col_offset, mappers):
@@ -960,27 +1031,22 @@ def _finalize_columns(
     c,
     c_offset,
     columns,
-    var_comps,
-    col_offset,
+    fixed,
+    fixed_val,
 ):
     """Fixed-variable substitution + drop columns that appear nowhere.
 
     Mirrors the stock ``LinearStandardFormCompiler``: a fixed variable's
     contribution moves into the row bounds / objective offset (the #3851
     pitfall), and columns that appear in neither ``A`` nor the objective are
-    eliminated.  Returns the trimmed arrays and the surviving ``columns`` list.
+    eliminated.  ``fixed`` / ``fixed_val`` are precomputed over the whole column
+    space (from classic per-index VarData *and* columnar arrays in bulk).
+    Returns the trimmed arrays, the surviving ``columns`` list, and ``keep_cols``
+    (the original column indices that survived, for the columnar map-back).
     """
     Acsc = A.tocsc()
-    n_var = Acsc.shape[1]
     col_nnz = np.diff(Acsc.indptr)
     appears = (col_nnz > 0) | (c != 0.0)
-
-    fixed = np.zeros(n_var, dtype=bool)
-    fixed_val = np.zeros(n_var, dtype=np.float64)
-    for vd, j in _iter_columns(columns):
-        if vd is not None and vd.fixed:
-            fixed[j] = True
-            fixed_val[j] = 0.0 if vd.value is None else float(vd.value)
 
     fixed_appears = fixed & appears
     if fixed_appears.any():
@@ -1002,9 +1068,5 @@ def _finalize_columns(
         c[keep_cols],
         c_offset,
         [columns[j] for j in keep_cols],
+        keep_cols,
     )
-
-
-def _iter_columns(columns):
-    for j, vd in enumerate(columns):
-        yield vd, j

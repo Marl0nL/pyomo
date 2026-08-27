@@ -105,9 +105,18 @@ class FastLoadCompiled:
     c_offset : float
     sense : ObjectiveSense
     has_objective : bool
-    columns : list[VarData]                  -- one per column of A (map-back)
+    columns : list[VarData | None]           -- one per column of A (map-back);
+        an entry is ``None`` for a column owned by a *columnar* Var, whose
+        solution is mapped back in bulk via ``column_scatter`` (no per-index
+        VarData is ever materialized for it).
     rows : list[(ConstraintData, int)]       -- one per row; int is the
         standard-form row multiplier (0 == equality, 1 == upper, -1 == lower)
+    column_scatter : list[(component, solver_cols, positions)] | None
+        Bulk solution map-back for transparently-columnar Var components: for
+        each such component, ``solver_cols`` (int array) are the surviving solver
+        columns and ``positions`` (int array) the matching column positions in
+        the component's value array, so ``comp.set_values(col_value[solver_cols],
+        where=positions)`` writes the whole solution with no object per index.
     hessian : scipy.sparse.csc_array | None  -- lower-triangular objective
         Hessian (``0.5 x'H x``) over the column space, or None for a pure-linear
         objective.  Carries the true objective sign (the HiGHS sense is set
@@ -127,6 +136,7 @@ class FastLoadCompiled:
         'has_objective',
         'columns',
         'rows',
+        'column_scatter',
         'hessian',
     )
 
@@ -145,6 +155,7 @@ class FastLoadCompiled:
         columns,
         rows,
         hessian=None,
+        column_scatter=None,
     ):
         self.A = A
         self.row_lower = row_lower
@@ -158,6 +169,7 @@ class FastLoadCompiled:
         self.has_objective = has_objective
         self.columns = columns
         self.rows = rows
+        self.column_scatter = column_scatter
         self.hessian = hessian
 
     @property
@@ -561,7 +573,75 @@ def build_highs_model(compiled: FastLoadCompiled):
 # --------------------------------------------------------------------------- #
 # Solution loader: map the HiGHS solution vectors back onto the Pyomo model
 # --------------------------------------------------------------------------- #
-class FastLoadHighsSolutionLoader(SolutionLoader):
+class _ColumnarMapBackMixin:
+    """Shared solution map-back for both the HiGHS and Gurobi fast loaders.
+
+    ``self._columns`` is a ``list[VarData | None]`` (one per solver column; a
+    ``None`` marks a column owned by a *columnar* Var) and ``self._column_scatter``
+    a ``list[(component, solver_cols, positions)]`` for those columnar owners
+    (empty / falsy when the model has no columnar Vars).  These helpers write a
+    full solution vector back -- per-object for classic columns, in one bulk
+    ``set_values`` per columnar component -- with no VarData materialized for the
+    columnar path.  A subclass calls :meth:`_init_columnar_maps` in ``__init__``.
+    """
+
+    def _init_columnar_maps(self):
+        self._col_map = None  # id(var) -> column (classic columns; built lazily)
+        self._scatter_map = None  # (id(component), pos) -> column (columnar; lazy)
+
+    def _build_maps(self):
+        if self._col_map is None:
+            self._col_map = {
+                id(v): j for j, v in enumerate(self._columns) if v is not None
+            }
+            smap = {}
+            for comp, solver_cols, positions in self._column_scatter or ():
+                cid = id(comp)
+                for j, pos in zip(solver_cols.tolist(), positions.tolist()):
+                    smap[(cid, pos)] = j
+            self._scatter_map = smap
+
+    def _col_for_var(self, v):
+        """Solver column of a requested VarData (classic or columnar), or None."""
+        self._build_maps()
+        j = self._col_map.get(id(v))
+        if j is not None:
+            return j
+        pos = getattr(v, '_pos', None)
+        if pos is not None:
+            return self._scatter_map.get((id(v.parent_component()), pos))
+        return None
+
+    def _load_all(self, values):
+        """Write a full solution vector back onto every Var (classic + columnar)."""
+        for v, val in zip(self._columns, values):
+            if v is not None:
+                v.set_value(val, skip_validation=True)
+        if self._column_scatter:
+            arr = np.asarray(values, dtype=np.float64)
+            for comp, solver_cols, positions in self._column_scatter:
+                comp.set_values(arr[solver_cols], where=positions)
+
+    def _map_all(self, values):
+        """ComponentMap of every Var -> its value (materializes columnar Vars)."""
+        res = ComponentMap(
+            (v, values[j]) for j, v in enumerate(self._columns) if v is not None
+        )
+        for comp, solver_cols, positions in self._column_scatter or ():
+            for j, pos in zip(solver_cols.tolist(), positions.tolist()):
+                res[comp[comp.index_at(pos)]] = values[j]
+        return res
+
+    def _map_selected(self, values, vars_to_load):
+        res = ComponentMap()
+        for v in vars_to_load:
+            j = self._col_for_var(v)
+            if j is not None:
+                res[v] = values[j]
+        return res
+
+
+class FastLoadHighsSolutionLoader(_ColumnarMapBackMixin, SolutionLoader):
     """Map a solved HiGHS model's solution back onto the original Pyomo objects.
 
     Columns and rows are kept in the exact order the standard-form compiler
@@ -569,14 +649,16 @@ class FastLoadHighsSolutionLoader(SolutionLoader):
     the HiGHS solution vectors -- no per-object solver map is needed.
     """
 
-    def __init__(self, solver_model, pyomo_model, columns, rows):
+    def __init__(self, solver_model, pyomo_model, columns, rows, column_scatter=None):
         super().__init__()
         self._solver_model = solver_model
         self._pyomo_model = pyomo_model
-        self._columns = columns  # list[VarData], column-ordered
+        self._columns = columns  # list[VarData|None], column-ordered
         self._rows = rows  # list[(ConstraintData, multiplier)], row-ordered
+        # Bulk map-back for columnar Var components (None column entries above).
+        self._column_scatter = column_scatter or ()
         self._sol = solver_model.getSolution()
-        self._col_map = None  # id(var) -> column index (built lazily)
+        self._init_columnar_maps()
 
     def get_number_of_solutions(self) -> int:
         return 1 if self._sol.value_valid else 0
@@ -585,21 +667,14 @@ class FastLoadHighsSolutionLoader(SolutionLoader):
         if not self._sol.value_valid:
             raise NoSolutionError()
 
-    def _build_col_map(self):
-        if self._col_map is None:
-            self._col_map = {id(v): j for j, v in enumerate(self._columns)}
-        return self._col_map
-
     def load_vars(self, vars_to_load: Sequence[VarData] | None = None) -> None:
         self._require_primal()
         col_value = self._sol.col_value
         if vars_to_load is None:
-            for v, val in zip(self._columns, col_value):
-                v.set_value(val, skip_validation=True)
+            self._load_all(col_value)
         else:
-            col_map = self._build_col_map()
             for v in vars_to_load:
-                j = col_map.get(id(v))
+                j = self._col_for_var(v)
                 if j is not None:
                     v.set_value(col_value[j], skip_validation=True)
         StaleFlagManager.mark_all_as_stale(delayed=True)
@@ -610,14 +685,8 @@ class FastLoadHighsSolutionLoader(SolutionLoader):
         self._require_primal()
         col_value = self._sol.col_value
         if vars_to_load is None:
-            return ComponentMap((v, col_value[j]) for j, v in enumerate(self._columns))
-        col_map = self._build_col_map()
-        res = ComponentMap()
-        for v in vars_to_load:
-            j = col_map.get(id(v))
-            if j is not None:
-                res[v] = col_value[j]
-        return res
+            return self._map_all(col_value)
+        return self._map_selected(col_value, vars_to_load)
 
     def get_reduced_costs(
         self, vars_to_load: Sequence[VarData] | None = None
@@ -626,14 +695,8 @@ class FastLoadHighsSolutionLoader(SolutionLoader):
             raise NoReducedCostsError()
         col_dual = self._sol.col_dual
         if vars_to_load is None:
-            return ComponentMap((v, col_dual[j]) for j, v in enumerate(self._columns))
-        col_map = self._build_col_map()
-        res = ComponentMap()
-        for v in vars_to_load:
-            j = col_map.get(id(v))
-            if j is not None:
-                res[v] = col_dual[j]
-        return res
+            return self._map_all(col_dual)
+        return self._map_selected(col_dual, vars_to_load)
 
     def get_duals(
         self, cons_to_load: Sequence[ConstraintData] | None = None
@@ -781,7 +844,7 @@ class FastLoadHighs(SolverBase):
         results.solver_config = config
         results.timing_info.highs_time = highs.getRunTime()
         results.solution_loader = FastLoadHighsSolutionLoader(
-            highs, model, compiled.columns, compiled.rows
+            highs, model, compiled.columns, compiled.rows, compiled.column_scatter
         )
 
         has_feasible_solution = info.primal_solution_status == 2

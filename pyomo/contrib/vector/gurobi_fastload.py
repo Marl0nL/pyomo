@@ -85,7 +85,11 @@ from pyomo.contrib.solver.common.factory import SolverFactory
 # Reuse the solver-neutral compile + the compiled-arrays container from the HiGHS
 # fastload module (this backend adds no new compiler -- only an array->Gurobi
 # builder and a Gurobi map-back).
-from pyomo.contrib.vector.fastload import compile_fastload_arrays, FastLoadCompiled
+from pyomo.contrib.vector.fastload import (
+    compile_fastload_arrays,
+    FastLoadCompiled,
+    _ColumnarMapBackMixin,
+)
 
 # gurobipy is imported lazily inside the methods that need it (this module is
 # imported at ``pyomo.contrib.vector`` import time to register the solver, and we
@@ -187,30 +191,42 @@ def _hessian_to_gurobi_Q(H):
 # --------------------------------------------------------------------------- #
 # Solution loader: map the captured Gurobi solution back onto Pyomo objects
 # --------------------------------------------------------------------------- #
-class FastLoadGurobiSolutionLoader(SolutionLoader):
+class FastLoadGurobiSolutionLoader(_ColumnarMapBackMixin, SolutionLoader):
     """Map a solved Gurobi model's solution back onto the original Pyomo objects.
 
     Columns are kept in the exact order the standard-form compiler produced them,
     so primal values / reduced costs index straight into the captured Gurobi
-    solution vectors -- no per-object solver map is needed.  Duals map through the
-    per-Gurobi-row ``con_of`` list (a two-sided range constraint contributes two
-    rows; the larger-magnitude dual is kept, matching ``highs_fastload`` and the
-    shipped GurobiDirect interface).
+    solution vectors -- no per-object solver map is needed.  Columnar Vars map
+    back in bulk via ``column_scatter`` (shared with ``highs_fastload`` through
+    :class:`~pyomo.contrib.vector.fastload._ColumnarMapBackMixin`).  Duals map
+    through the per-Gurobi-row ``con_of`` list (a two-sided range constraint
+    contributes two rows; the larger-magnitude dual is kept, matching
+    ``highs_fastload`` and the shipped GurobiDirect interface).
 
     The solution vectors are captured *eagerly* at postsolve (``col_value``,
     ``col_rc``, ``row_dual``) -- ``None`` where Gurobi does not provide them (no
     solution, or duals / reduced costs on a MIP).
     """
 
-    def __init__(self, pyomo_model, columns, con_of, col_value, col_rc, row_dual):
+    def __init__(
+        self,
+        pyomo_model,
+        columns,
+        con_of,
+        col_value,
+        col_rc,
+        row_dual,
+        column_scatter=None,
+    ):
         super().__init__()
         self._pyomo_model = pyomo_model  # for load_import_suffixes (dual / rc)
-        self._columns = columns  # list[VarData], column-ordered
+        self._columns = columns  # list[VarData|None], column-ordered
+        self._column_scatter = column_scatter or ()
         self._con_of = con_of  # list[ConstraintData], one per Gurobi row
         self._col_value = col_value
         self._col_rc = col_rc
         self._row_dual = row_dual
-        self._col_map = None  # id(var) -> column index (built lazily)
+        self._init_columnar_maps()
 
     def get_number_of_solutions(self) -> int:
         return 1 if self._col_value is not None else 0
@@ -219,21 +235,14 @@ class FastLoadGurobiSolutionLoader(SolutionLoader):
         if self._col_value is None:
             raise NoSolutionError()
 
-    def _build_col_map(self):
-        if self._col_map is None:
-            self._col_map = {id(v): j for j, v in enumerate(self._columns)}
-        return self._col_map
-
     def load_vars(self, vars_to_load: Sequence[VarData] | None = None) -> None:
         self._require_primal()
         col_value = self._col_value
         if vars_to_load is None:
-            for v, val in zip(self._columns, col_value):
-                v.set_value(val, skip_validation=True)
+            self._load_all(col_value)
         else:
-            col_map = self._build_col_map()
             for v in vars_to_load:
-                j = col_map.get(id(v))
+                j = self._col_for_var(v)
                 if j is not None:
                     v.set_value(col_value[j], skip_validation=True)
         StaleFlagManager.mark_all_as_stale(delayed=True)
@@ -244,14 +253,8 @@ class FastLoadGurobiSolutionLoader(SolutionLoader):
         self._require_primal()
         col_value = self._col_value
         if vars_to_load is None:
-            return ComponentMap((v, col_value[j]) for j, v in enumerate(self._columns))
-        col_map = self._build_col_map()
-        res = ComponentMap()
-        for v in vars_to_load:
-            j = col_map.get(id(v))
-            if j is not None:
-                res[v] = col_value[j]
-        return res
+            return self._map_all(col_value)
+        return self._map_selected(col_value, vars_to_load)
 
     def get_reduced_costs(
         self, vars_to_load: Sequence[VarData] | None = None
@@ -260,14 +263,8 @@ class FastLoadGurobiSolutionLoader(SolutionLoader):
             raise NoReducedCostsError()
         col_rc = self._col_rc
         if vars_to_load is None:
-            return ComponentMap((v, col_rc[j]) for j, v in enumerate(self._columns))
-        col_map = self._build_col_map()
-        res = ComponentMap()
-        for v in vars_to_load:
-            j = col_map.get(id(v))
-            if j is not None:
-                res[v] = col_rc[j]
-        return res
+            return self._map_all(col_rc)
+        return self._map_selected(col_rc, vars_to_load)
 
     def get_duals(
         self, cons_to_load: Sequence[ConstraintData] | None = None
@@ -517,7 +514,13 @@ class FastLoadGurobi(SolverBase):
         except (gp.GurobiError, AttributeError):
             pass
         results.solution_loader = FastLoadGurobiSolutionLoader(
-            model, compiled.columns, con_of, col_value, col_rc, row_dual
+            model,
+            compiled.columns,
+            con_of,
+            col_value,
+            col_rc,
+            row_dual,
+            compiled.column_scatter,
         )
 
         if has_feasible_solution:
