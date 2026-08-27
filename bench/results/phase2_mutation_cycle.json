@@ -1,0 +1,26 @@
+{
+  "mutation_cycle": [
+    {
+      "size": "xs",
+      "nnz": 256,
+      "steps": 12,
+      "feasible_steps": 12,
+      "warm_resolve_ms_median": 0.269,
+      "cold_reload_ms_median": 2.243,
+      "warm_speedup": 8.35,
+      "max_rel_objective_mismatch": 0.0,
+      "warm_cold_agree": true
+    },
+    {
+      "size": "1e4",
+      "nnz": 6388,
+      "steps": 12,
+      "feasible_steps": 12,
+      "warm_resolve_ms_median": 1.018,
+      "cold_reload_ms_median": 18.947,
+      "warm_speedup": 18.62,
+      "max_rel_objective_mismatch": 0.0,
+      "warm_cold_agree": true
+    }
+  ]
+}

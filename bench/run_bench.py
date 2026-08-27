@@ -68,6 +68,26 @@ def _pyomo_models() -> Dict[str, Any]:
     return reg
 
 
+def _vector_models() -> Dict[str, Any]:
+    """Registry of ``pyomo.contrib.vector`` fast-path build modules by model.
+
+    Each module exposes ``build_pyomo(params)`` returning an all-vector model
+    (VectorVar / VectorConstraint / VectorObjective) with component names and
+    index tuples identical to the classic build (so the equivalence oracle can
+    map the two column spaces).
+    """
+    from bench.models import network_flow_vector, supply_chain_vector
+
+    return {
+        "network_flow": network_flow_vector,
+        "supply_chain": supply_chain_vector,
+    }
+
+
+def _resolve_vector(model: str):
+    return _vector_models()[model]
+
+
 # Logical model "facility_location_q" reuses the facility module with the
 # quadratic objective turned on.
 _QUAD_ALIAS = {"facility_location_q": "facility_location"}
@@ -83,8 +103,9 @@ PYOMO_MODEL_NAMES = [
 
 COMPARATOR_MODEL_NAMES = ["network_flow", "facility_location"]
 
-# Models with a pyomo.contrib.vector fast-path implementation (Phase 1).
-VECTOR_MODEL_NAMES = ["network_flow"]
+# Models with a pyomo.contrib.vector fast-path implementation (Phase 1 dense
+# network_flow; Phase 2 adds the ragged supply_chain).
+VECTOR_MODEL_NAMES = ["network_flow", "supply_chain"]
 
 # Models measured on the Phase-3 template-vectorized construction leg: all the
 # classic pyomo models (templatizable-heavy AND non-templatizable), so both the
@@ -509,8 +530,8 @@ def run_pyomo_vector_case(
     end-to-end total.
     """
     if model not in VECTOR_MODEL_NAMES:
-        return {"skipped": f"vector fast path not implemented for {model} (Phase 1)"}
-    from bench.models import network_flow_vector
+        return {"skipped": f"vector fast path not implemented for {model}"}
+    vec_mod = _resolve_vector(model)
     from pyomo.contrib.vector import assemble, matrices_to_highs_lp
     import highspy
 
@@ -520,7 +541,7 @@ def run_pyomo_vector_case(
     # Stage 1: construct (fresh vector model each iteration).
     con_timing, m = timing.time_construct(
         "construct",
-        lambda: network_flow_vector.build_pyomo(params),
+        lambda: vec_mod.build_pyomo(params),
         repeats=repeats,
         warmup=warmup,
     )
@@ -576,17 +597,20 @@ def _validate_vector(
       C. the direct ``passModel`` solve objective matches a classic APPSI solve.
     """
     out: Dict[str, Any] = {}
+    classic_mod, _ = _resolve_pyomo(model)
 
     # A. Fast splice vs stock compiler (self-contained, keeps vector_model clean).
+    #    This is the model-agnostic strong gate: it needs only the classic build
+    #    (no array-native ground truth), so it covers every vector model,
+    #    including the ragged supply_chain.
     try:
-        from bench.models import network_flow as classic_nf
         from pyomo.contrib.vector import compile_standard_form
         from pyomo.repn.plugins.standard_form import LinearStandardFormCompiler
         from pyomo.contrib.vector.tests.equivalence_oracle import (
             canonical_standard_form,
         )
 
-        classic = classic_nf.build_pyomo(params)
+        classic = classic_mod.build_pyomo(params)
         iv = compile_standard_form(vector_model, mixed_form=True)
         ic = LinearStandardFormCompiler().write(classic, mixed_form=True)
         out["fast_splice_equivalent"] = canonical_standard_form(
@@ -596,40 +620,46 @@ def _validate_vector(
         out["fast_splice_error"] = f"{type(e).__name__}: {e}"
 
     # B. Committed harness equivalence oracle: (scalarized) vector model vs the
-    # array-native ground truth (the artifact firstmate asked Phase 1 to consume).
+    # array-native ground truth.  Only defined for models with an array-native
+    # builder (network_flow, facility_location); the ragged supply_chain has no
+    # array-native comparator (its whole point is that a dense grid is wrong), so
+    # gate A above is the equivalence gate for it.
     try:
-        from bench import equivalence as eq
         from bench.comparators import array_native
 
-        mx = array_native.BUILDERS[model](dict(params))
-        fresh = network_flow_vector_build(params)  # scalarized by the oracle walk
-        Pv = eq.pyomo_standard_form(fresh)
-        Av = eq.array_standard_form(mx)
-        out["oracle_rows_equal"] = bool(Pv["rows"] == Av["rows"])
-        out["oracle_bounds_equal"] = bool(Pv["bounds"] == Av["bounds"])
-        out["oracle_obj_equal"] = bool(Pv["obj_terms"] == Av["obj_terms"])
-        out["oracle_var_names_equal"] = bool(Pv["var_names"] == Av["var_names"])
-        out["oracle_equivalent"] = all(
-            out[k]
-            for k in (
-                "oracle_rows_equal",
-                "oracle_bounds_equal",
-                "oracle_obj_equal",
-                "oracle_var_names_equal",
+        if model not in getattr(array_native, "SUPPORTED", ()):
+            out["oracle_skipped"] = f"no array-native comparator for {model}"
+        else:
+            from bench import equivalence as eq
+
+            mx = array_native.BUILDERS[model](dict(params))
+            fresh = _vector_build(model, params)  # scalarized by the oracle walk
+            Pv = eq.pyomo_standard_form(fresh)
+            Av = eq.array_standard_form(mx)
+            out["oracle_rows_equal"] = bool(Pv["rows"] == Av["rows"])
+            out["oracle_bounds_equal"] = bool(Pv["bounds"] == Av["bounds"])
+            out["oracle_obj_equal"] = bool(Pv["obj_terms"] == Av["obj_terms"])
+            out["oracle_var_names_equal"] = bool(Pv["var_names"] == Av["var_names"])
+            out["oracle_equivalent"] = all(
+                out[k]
+                for k in (
+                    "oracle_rows_equal",
+                    "oracle_bounds_equal",
+                    "oracle_obj_equal",
+                    "oracle_var_names_equal",
+                )
             )
-        )
     except Exception as e:
         out["oracle_error"] = f"{type(e).__name__}: {e}"
 
     # C. Solve-objective agreement (fast passModel vs classic APPSI HiGHS).
     try:
-        from bench.models import network_flow as classic_nf
         from bench.harness import stages
         from pyomo.contrib.vector.highs import solve_highs
         import pyomo.environ as pyo
 
-        _, ov = solve_highs(network_flow_vector_build(params))
-        classic = classic_nf.build_pyomo(params)
+        _, ov = solve_highs(_vector_build(model, params))
+        classic = classic_mod.build_pyomo(params)
         stages.solve_highs(classic)
         oc = float(pyo.value(classic.obj))
         out["objective_fast"] = round(ov, 6)
@@ -638,6 +668,10 @@ def _validate_vector(
     except Exception as e:
         out["solve_error"] = f"{type(e).__name__}: {e}"
     return out
+
+
+def _vector_build(model, params):
+    return _resolve_vector(model).build_pyomo(params)
 
 
 def network_flow_vector_build(params):

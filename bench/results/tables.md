@@ -159,3 +159,37 @@ _Authoritative check: the constraint system as a multiset of sign-normalized row
 | 10 | 100 | 1,000 | ✅ | 17 ms | 90 ms | 0.19× |
 | 20 | 250 | 5,000 | ✅ | 140 ms | 835 ms | 0.17× |
 
+
+
+## Phase 2 — ragged supply-chain on the vector fast path + mutation cycle
+
+**Ragged supply-chain (sparse multi-echelon lanes) — build-to-solver, vector API vs classic.**
+Time-to-solver = construct + repn/assemble + HiGHS load (no solve). Vector build is
+standard-form equivalent to the classic build (oracle Gate A) and solves to the same
+objective (Gate C). `bench/results/phase2_supply_chain.json`.
+
+| size | nnz | classic construct | classic repn | classic load | classic **TTS** | vector construct | vector assemble | vector load | vector **TTS** | **speedup** |
+|------|-----|-------------------|--------------|--------------|-----------------|------------------|-----------------|-------------|----------------|-------------|
+| xs   | 256    | 1.3 ms | 1.2 ms  | 3.9 ms  | 6.4 ms   | 1.4 ms  | 0.22 ms | 0.3 ms  | 1.9 ms  | 3.3× |
+| 1e4  | 6,388  | 15.3 ms | 14.0 ms | 64.6 ms | 93.9 ms  | 6.9 ms  | 0.35 ms | 1.5 ms  | 8.8 ms  | **10.7×** |
+| 1e5  | 57,330 | 124.8 ms | 124.6 ms | 551.1 ms | 800.4 ms | 51.4 ms | 1.17 ms | 10.4 ms | 62.9 ms | **12.7×** |
+
+_The assemble stage (CSR stack, no tree walk) is ~100× cheaper than the classic repn walk;
+the array `passModel` load is ~50× cheaper than per-row APPSI loading. This is the ragged
+case linopy/xarray cannot express idiomatically (scoping doc R5) — no dense `S·W`/`W·R`
+grid is ever allocated. Run: `python -m bench.run_bench --models supply_chain --backends pyomo,pyomo_vector --sizes 1e4,1e5`._
+
+**Mutation cycle (fix / unfix / bounds / mask sweep) — persistent warm re-solve vs cold reload.**
+One `VectorPersistentHighs` mutates the columnar components in place and pushes only the
+dirty columns/rows through HiGHS `changeColsBounds`/`changeRowsBounds` (warm basis retained);
+the cold route rebuilds + `passModel` each step. Both agree on every step's objective
+(exact). `bench/results/phase2_mutation_cycle.json`.
+
+| size | nnz | steps | warm re-solve (median) | cold reload (median) | **warm speedup** | objectives agree |
+|------|-----|-------|------------------------|----------------------|------------------|------------------|
+| xs   | 256   | 12 | 0.27 ms | 2.24 ms  | 8.4×  | ✅ (0 mismatch) |
+| 1e4  | 6,388 | 12 | 1.02 ms | 18.95 ms | **18.6×** | ✅ (0 mismatch) |
+
+_The `supply_chain` generator produces an infeasible instance at 1e5+ (a pre-existing data
+property — the classic build is equally infeasible there); the mutation cycle therefore sweeps
+the feasible sizes. Run: `python -m bench.mutation_cycle --sizes xs,1e4`._
