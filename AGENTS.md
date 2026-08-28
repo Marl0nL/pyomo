@@ -35,7 +35,14 @@ coefficients via a value-aware guard (verify the values each roll, not the
 mutability flag) — see `bench/VALUEGUARD_REPORT.md` — and engages on models with
 **non-affine** param participation (`price*duration`, `dur/eff`) by **folding**
 the verified-static params as watched constants — see `bench/STATICFOLD_REPORT.md`
-(`FastStepHighs.classification_report()` shows what folded). `highs_faststep` also
+(`FastStepHighs.classification_report()` shows what folded). When a guarded (folded
+or matrix-templated) coefficient **genuinely changes** every roll (the shrinking-
+first-interval MPC), `on_matrix_change='patch'` makes it a **warm update** instead
+of a reload: a partial in-place refold (classification unchanged, only the affected
+templates' values re-derived + validated) plus per-entry `changeCoeff` on the
+changed A-entries, basis kept; degrades to reload past `patch_max_entries` (auto
+`max(4096, nnz//4)`) or on a Hessian-feeding fold. Opt-in (default stays fail-loud
+`'error'`). See `bench/COEFF_PATCH_REPORT.md`. `highs_faststep` also
 does **masked warm updates** — a solver-side overlay of **row masks** (relax rows
 to free: `deactivate_rows`/`activate_rows`) + **variable fixes** (pin to a value via
 equal bounds: `fix_variables`/`unfix_variables`, or `set_window`/`clear_window` for
