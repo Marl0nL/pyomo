@@ -138,12 +138,55 @@ walk) and compares them to that baseline:
   ``on_matrix_change='error'`` fails loud, naming the offending Param /
   coefficient(s); the opt-in ``on_matrix_change='reload'`` instead rebuilds the
   whole standard-form matrix and reloads it (a fresh ``passModel``, basis reset)
-  for that solve, then continues.
+  for that solve, then continues; the opt-in ``on_matrix_change='patch'``
+  *keeps the warm basis* and applies just the change (see below).
 
 The guard's coefficient mapping (which mutable Params feed which ``A``-entries,
-with what affine relation) is a standalone, reusable component: a later batch
-matrix-update path can reuse it to *apply* a genuine change; this guard only
-*detects* change.
+with what affine relation) is a standalone, reusable component: the
+``on_matrix_change='patch'`` path reuses it to *apply* a genuine change; this
+guard itself only *detects* change.
+
+Warm matrix-coefficient patch (``on_matrix_change='patch'``)
+------------------------------------------------------------
+A guarded coefficient does not always hold still -- the honest asymmetry a masked
+rolling-horizon MPC exposes is a coefficient that *genuinely changes every tick*:
+the current control interval's remaining duration shrinks as real time advances
+within it, a mutable ``duration`` on the state-of-charge recurrence's charge term
+(and, when it also prices energy, a folded hub over every ``price[t]``).  Under
+``'error'`` that trips the guard every tick; under ``'reload'`` it re-compiles and
+resets the basis every tick.  Both throw away the warm state for what is usually a
+*small, sparse* change.
+
+``on_matrix_change='patch'`` makes that change a **first-class warm update**,
+reusing the coefficient mapping the guard already built:
+
+* a genuinely-changed **folded** parameter triggers a **partial refold** -- the
+  fold *classification* is unchanged (a patched fold is still folded), only the
+  values baked into the affected affine templates are re-derived, *in place*, for
+  exactly the rows that folded value fed (``_AffineArray.refold_rows``: same fold
+  set + parameter registry as ``set_instance``, so the sparse column positions are
+  identical and only the coefficients move).  The re-templated rows are validated
+  against a fresh ``value()`` at the model's current state -- the ``set_instance``
+  self-check restricted to the affected subset -- so a patch is never a stale (or
+  wrong) template;
+* the changed **matrix ``A``-entries** are patched with per-entry ``changeCoeff``
+  (HiGHS exposes no batch matrix-entry update; the change-set is bounded, and a
+  per-entry patch is measured to stay far cheaper than a whole-matrix reload up to
+  ``patch_max_entries``), while the objective / bound groups ride the ordinary
+  vectorized template push (which re-pushes every solve anyway);
+* the **warm simplex basis is kept**, so the re-solve is a handful of iterations.
+
+The change-set is bounded by ``patch_max_entries`` (default auto
+``max(4096, nnz // 4)``): a larger change degrades to a reload with a one-line log
+note, never a pathological entry-by-entry storm.  A folded parameter feeding the
+(un-templated, loaded-once) objective **Hessian** likewise degrades to a reload --
+the Hessian cannot be patched.  The patch composes with the row-mask / variable-fix
+overlay (a coefficient patch and a window narrowing apply in one warm step) and
+with the array-driven path for a matrix (varying-parameter) change; a *folded*
+change stays fatal in array mode (the refold re-derives templates from the model,
+which the array may not reflect).  ``'patch'`` is **opt-in** -- the default stays
+the fail-loud ``'error'`` -- so an existing model's behavior is unchanged until it
+asks for the patch path.
 
 Verified-static parameter folding (non-affine param participation)
 ------------------------------------------------------------------
@@ -171,9 +214,11 @@ succeeds; the model that was rejected now engages the warm path.
 Every folded Param joins the value-guard watch list: each warm solve verifies
 (vectorized) that the folded values are unchanged from ``set_instance``.  A
 genuine change to a folded value means the templates are stale *by construction*
--- the default ``on_matrix_change='error'`` fails loud naming the Param, and the
+-- the default ``on_matrix_change='error'`` fails loud naming the Param, the
 opt-in ``on_matrix_change='reload'`` re-folds, re-templates, and reloads a fresh
-model for that solve.  Never a silent stale solve.  A product of two *genuinely
+model for that solve, and the opt-in ``on_matrix_change='patch'`` re-templates
+only the affected rows in place and keeps the basis (a *partial refold* -- see the
+"Warm matrix-coefficient patch" section).  Never a silent stale solve.  A product of two *genuinely
 varying* Params (no static factor to fold, e.g. a lone ``p*q``) is still rejected
 loudly -- there is no correct affine template for it.  :attr:`folded_parameters`
 / :attr:`templated_parameters` / :meth:`classification_report` expose which
@@ -193,7 +238,8 @@ Scope (fail loud, never a stale-matrix solve)
 * **Constraint-matrix coefficients are value-guarded, not assumed static.**  A
   mutable matrix coefficient is accepted (see the value-guard section above); a
   coefficient that stays put warm-solves on the kept basis, one that genuinely
-  changes fails loud or (opt-in) triggers a reload -- never a stale solve.
+  changes fails loud, or (opt-in) triggers a reload, or (opt-in) is **patched in
+  place on the kept basis** (``on_matrix_change='patch'``) -- never a stale solve.
 * **A coefficient non-affine in the parameters** (a product / reciprocal of
   Params, e.g. ``price*duration``) is handled by folding its verified-static
   factor (see the folding section above): the practically-constant Param is
@@ -486,6 +532,60 @@ class _AffineArray:
         np.clip(out, -hinf, hinf, out=out)
         return out
 
+    def refold_rows(self, rows, slots, param_index, folded_ids):
+        """Re-template the given ``rows`` in place at the model's *current* values.
+
+        A **partial refold** (the ``on_matrix_change='patch'`` warm path): a folded
+        (verified-static) parameter's value genuinely changed, so every template
+        that baked that value in as a constant is stale.  Re-derive each affected
+        slot with the *same* fold set and parameter registry -- exactly the
+        :func:`_coef_signature` / :func:`_affine_from_sig` decomposition
+        ``set_instance`` ran, but reading the new folded values off the model -- and
+        overwrite this array's ``base[i]`` and the ``M`` row's stored coefficients.
+
+        The fold set and parameter registry are unchanged (the classification stays
+        coherent -- a patched fold is still folded), so the affine decomposition's
+        column *positions* are identical to ``set_instance``; only the numeric
+        coefficients move.  That lets the ``M`` row update happen **in place** on the
+        existing sparse positions (``scipy`` keeps explicit zeros, so a coefficient
+        that was zero at ``set_instance`` still has a slot), an ``O(affected nnz)``
+        edit rather than an ``O(nnz)`` rebuild.  A position that is somehow no longer
+        present (it cannot be, with a fixed fold set) fails loud rather than
+        silently dropping a coefficient.
+        """
+        M = self.M
+        indptr, indices, data, base = M.indptr, M.indices, M.data, self.base
+        for i in rows:
+            i = int(i)
+            aff = _affine_from_sig(_coef_signature(slots[i]), param_index, folded_ids)
+            if aff is None or aff is _NONAFFINE:
+                raise IncompatibleModelError(
+                    f"The '{FastStepHighs.name}' warm interface could not re-template "
+                    "a folded coefficient during a patch update (it is no longer "
+                    "affine in the varying parameters).  Use on_matrix_change='reload'."
+                )
+            shift, coefs = aff
+            base[i] = shift
+            lo, hi = int(indptr[i]), int(indptr[i + 1])
+            if hi > lo:
+                data[lo:hi] = 0.0
+                rowcols = indices[lo:hi]
+                for pos, c in coefs.items():
+                    hit = np.nonzero(rowcols == pos)[0]
+                    if hit.size == 0:
+                        raise IncompatibleModelError(
+                            f"The '{FastStepHighs.name}' warm interface refold "
+                            "introduced a new template position; the fold structure "
+                            "changed.  Use on_matrix_change='reload'."
+                        )
+                    data[lo + int(hit[0])] = c
+            elif coefs:
+                raise IncompatibleModelError(
+                    f"The '{FastStepHighs.name}' warm interface refold introduced "
+                    "template coefficients on a constant row.  Use "
+                    "on_matrix_change='reload'."
+                )
+
     @property
     def has_residual(self):
         return bool(self.residual)
@@ -596,6 +696,68 @@ def _build_affine_array(
         (np.asarray(data, dtype=np.float64), (rows, cols)), shape=(n, n_params)
     )
     return _AffineArray(M, base, residual)
+
+
+def _folded_slot_map(slots, sig_by_id, folded_ids):
+    """Map ``folded param id -> np.ndarray of affected slot positions`` for one
+    template group.
+
+    The inverse of the fold: which template rows baked in *this* folded
+    parameter's value, so a genuine change to it (the ``patch`` warm path) can find
+    exactly the rows to re-template.  Only *affine* (templated) slots are indexed:
+    a constant / open slot has no parameters, and a **residual** slot is
+    re-evaluated with ``value()`` on every solve (so it self-updates -- no refold
+    needed).  Values are ``np.ndarray[int64]`` so a change-set's affected count is
+    an ``O(1)`` length read per folded parameter.
+    """
+    acc = {}
+    for i, s in enumerate(slots):
+        if s is None or s.__class__ is float or s.__class__ is int:
+            continue
+        sig = sig_by_id[id(s)]
+        if sig.kind == _SIG_RESIDUAL:
+            continue  # a fixed-variable residual self-updates via value() each solve
+        for p in sig.all_params:
+            pid = id(p)
+            if pid in folded_ids:
+                acc.setdefault(pid, []).append(i)
+    return {fid: np.asarray(v, dtype=np.int64) for fid, v in acc.items()}
+
+
+class _RefoldTarget:
+    """One template group's partial-refold handle: the :class:`_AffineArray` to
+    patch, the source ``slots`` (Pyomo expressions) to re-derive from, and the
+    ``folded_id -> affected rows`` map.  Shared by every group (objective
+    coefficients / offset, row bounds, variable bounds) and the matrix guard's
+    coefficient template, so the patch path treats them uniformly."""
+
+    __slots__ = ('affine', 'slots', 'folded_to_slots')
+
+    def __init__(self, affine, slots, folded_to_slots):
+        self.affine = affine
+        self.slots = slots
+        self.folded_to_slots = folded_to_slots
+
+    def affected_slots(self, changed_ids):
+        """Unique row positions this group must re-template for ``changed_ids``."""
+        arrs = [
+            self.folded_to_slots[fid]
+            for fid in changed_ids
+            if fid in self.folded_to_slots
+        ]
+        if not arrs:
+            return np.empty(0, dtype=np.int64)
+        return np.unique(np.concatenate(arrs))
+
+    def count_affected(self, changed_ids):
+        """Cheap upper-bound row count (an ``O(len(changed_ids))`` length sum; a
+        row shared by two changed folded params is double-counted -- harmless, it
+        only biases the degrade-to-reload decision toward reloading)."""
+        return sum(
+            len(self.folded_to_slots[fid])
+            for fid in changed_ids
+            if fid in self.folded_to_slots
+        )
 
 
 def _classify_folded(sigs, hub_min=2):
@@ -898,6 +1060,14 @@ class _MutablePlan:
         'matrix_guard',
         'folded_params',
         'folded_baseline',
+        # Partial-refold support (the ``on_matrix_change='patch'`` warm path): the
+        # fold set, the per-group refold handles (:class:`_RefoldTarget`), and the
+        # folded params that feed the (static) objective Hessian (a change to one
+        # cannot be patched -- the Hessian is not templated -- so it degrades to a
+        # reload).  ``refold_targets`` is empty when nothing folded.
+        'folded_ids',
+        'hessian_folded_ids',
+        'refold_targets',
         # Columnar-aware bulk readers (None => the simple per-Param path); built
         # once from ``params`` / ``folded_params`` at plan construction.
         '_param_reader',
@@ -1350,6 +1520,7 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
     # (like a static matrix coefficient).  If such a Param also *varies* elsewhere
     # (it is a live template Param), the loaded Hessian would silently go stale
     # between rolls -- reject loudly rather than warm-solve a stale QP.
+    hessian_folded_ids = set()
     for qcoef in quad_param_slots:
         for p in identify_mutable_parameters(qcoef):
             pid = id(p)
@@ -1361,6 +1532,10 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
                     "A genuinely varying Hessian is not supported on the warm path; "
                     "call set_instance again to reload a changed Hessian."
                 )
+            # A Hessian-feeding folded param cannot be patched (the Hessian is
+            # loaded once and never templated): a genuine change to it degrades to
+            # a full reload on the patch path.
+            hessian_folded_ids.add(pid)
             if pid not in folded_seen:
                 folded_seen.add(pid)
                 folded_params.append(p)
@@ -1370,6 +1545,8 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
     plan.params = params
     plan.param_index = param_index
     plan.folded_params = folded_params
+    plan.folded_ids = frozenset(folded_ids)
+    plan.hessian_folded_ids = frozenset(hessian_folded_ids)
     # Columnar-aware bulk readers for the two hot-path reads (a classic model
     # keeps the per-Param path -- these are ``None``).
     plan._param_reader = _build_param_reader(params)
@@ -1524,6 +1701,33 @@ def _build_mutable_plan(model, compiled: FastLoadCompiled):
         mat_rows_arr, mat_cols_arr, matrix_affine, baseline, mat_prov
     )
 
+    # --- partial-refold targets (the ``on_matrix_change='patch'`` warm path) -- #
+    # For each template group carrying a folded parameter, the handle the patch
+    # path uses to re-template exactly the rows a genuine folded change touches
+    # (objective coefficients / offset, row bounds, variable bounds, and the
+    # matrix guard's coefficient template).  A model with nothing folded needs no
+    # refold, so ``refold_targets`` stays empty and the patch path is a no-op for
+    # matrix-only changes (which the guard patches directly).
+    plan.refold_targets = []
+    if folded_params:
+        for slots, affine in (
+            (obj_slots, plan.obj_affine),
+            (
+                [obj_offset_slot] if obj_offset_slot is not None else [],
+                plan.obj_offset_affine,
+            ),
+            (row_lower_slots, plan.row_lower_affine),
+            (row_upper_slots, plan.row_upper_affine),
+            (col_lower_slots, plan.col_lower_affine),
+            (col_upper_slots, plan.col_upper_affine),
+            (mat_slots, matrix_affine),
+        ):
+            if affine is None or affine.n == 0:
+                continue
+            fmap = _folded_slot_map(slots, sig_by_id, folded_ids)
+            if fmap:
+                plan.refold_targets.append(_RefoldTarget(affine, slots, fmap))
+
     # --- classification transparency ---------------------------------------- #
     if folded_params:
         logger.info(
@@ -1638,11 +1842,20 @@ class FastStepHighs:
     name = 'highs_faststep'
 
     #: Accepted ``on_matrix_change`` policies (see :meth:`set_instance`).
-    _MATRIX_CHANGE_POLICIES = ('error', 'reload')
+    _MATRIX_CHANGE_POLICIES = ('error', 'reload', 'patch')
+
+    #: Floor for the auto patch degrade threshold (see ``patch_max_entries``).
+    _PATCH_MAX_FLOOR = 4096
 
     _available = None
 
-    def __init__(self, on_matrix_change='error', matrix_atol=0.0, matrix_rtol=0.0):
+    def __init__(
+        self,
+        on_matrix_change='error',
+        matrix_atol=0.0,
+        matrix_rtol=0.0,
+        patch_max_entries=None,
+    ):
         self.config = self.CONFIG()
         self._model = None
         self._compiled = None
@@ -1656,6 +1869,16 @@ class FastStepHighs:
         self._on_matrix_change = self._check_matrix_policy(on_matrix_change)
         self._matrix_atol = float(matrix_atol)
         self._matrix_rtol = float(matrix_rtol)
+        # Patch degrade threshold: a change-set larger than this (total affected
+        # template + matrix entries) degrades to a full reload rather than a long
+        # per-entry ``changeCoeff`` storm.  ``None`` => resolved at ``set_instance``
+        # to ``max(_PATCH_MAX_FLOOR, nnz // 4)`` (measured: a per-entry patch beats
+        # a reload well past that, so the default only trips on a genuinely dense
+        # change -- a sign the "static" assumption is wrong).
+        self._patch_max_entries = (
+            None if patch_max_entries is None else int(patch_max_entries)
+        )
+        self._patch_max_resolved = None
         # --- masked warm updates (row masks / variable fixes) ----------------- #
         # A solver-side overlay on top of the template-driven bounds, so a
         # rolling-horizon MPC can narrow its *active window* between solves
@@ -1728,6 +1951,7 @@ class FastStepHighs:
         on_matrix_change=None,
         matrix_atol=None,
         matrix_rtol=None,
+        patch_max_entries=None,
         **options,
     ):
         """Compile ``model`` once, build the affine templates, and load HiGHS.
@@ -1735,19 +1959,34 @@ class FastStepHighs:
         Value-aware static-matrix guard options (may also be set on the
         constructor):
 
-        on_matrix_change : {'error', 'reload'}
-            What to do when a warm solve finds a constraint-matrix coefficient
-            has genuinely changed since ``set_instance``.  ``'error'`` (the
-            default) fails loud, naming the offending coefficient(s) -- a warm
-            re-solve on the retained basis would use a stale matrix.  ``'reload'``
-            transparently rebuilds the whole standard-form matrix and reloads it
-            (basis reset) for that solve, then continues.  Neither ever solves a
-            stale matrix.
+        on_matrix_change : {'error', 'reload', 'patch'}
+            What to do when a warm solve finds a constraint-matrix coefficient (or
+            a folded verified-static parameter) has genuinely changed since
+            ``set_instance``.  ``'error'`` (the default) fails loud, naming the
+            offending coefficient(s) / parameter(s) -- a warm re-solve on the
+            retained basis would use a stale matrix.  ``'reload'`` transparently
+            rebuilds the whole standard-form matrix and reloads it (basis reset)
+            for that solve, then continues.  ``'patch'`` **keeps the warm basis**:
+            it re-templates just the affected rows in place (a partial refold, the
+            classification unchanged) and patches only the changed matrix entries
+            with per-entry ``changeCoeff`` (plus the batched objective / bound
+            pushes), so a small, sparse coefficient change -- the shrinking-first-
+            interval MPC case -- is a first-class warm update instead of a reload.
+            None of the three ever solves a stale matrix; ``'patch'`` degrades to a
+            reload when the change-set is large (see ``patch_max_entries``).
         matrix_atol, matrix_rtol : float
             The comparison tolerance against the loaded coefficient values.  Both
             default to ``0.0`` -- an **exact** comparison, so any drift trips the
             guard.  Widen for a tight tolerance on models whose matrix Params
             round-trip with tiny numerical noise.
+        patch_max_entries : int, optional
+            (``'patch'`` only.)  The largest change-set the patch path applies
+            per-entry before degrading to a full reload -- a safety valve against a
+            pathological entry-by-entry storm when a nominally-static coefficient
+            is in fact churning wholesale.  ``None`` (the default) resolves to
+            ``max(4096, nnz // 4)`` at ``set_instance``; a per-entry patch is
+            measured to beat a reload far past that, so the default degrades only on
+            a genuinely dense change.
         """
         import highspy
 
@@ -1762,11 +2001,18 @@ class FastStepHighs:
             self._matrix_atol = float(matrix_atol)
         if matrix_rtol is not None:
             self._matrix_rtol = float(matrix_rtol)
+        if patch_max_entries is not None:
+            self._patch_max_entries = int(patch_max_entries)
         if options:
             self.config = self.config(value=options, preserve_implicit=True)
 
         compiled = compile_to_highs_arrays(model)
         plan = _build_mutable_plan(model, compiled)  # includes the template self-check
+        self._patch_max_resolved = (
+            self._patch_max_entries
+            if self._patch_max_entries is not None
+            else max(self._PATCH_MAX_FLOOR, compiled.nnz // 4)
+        )
 
         lp = build_highs_model(compiled)  # HighsModel (with Hessian) for a QP
         highs = highspy.Highs()
@@ -1930,8 +2176,9 @@ class FastStepHighs:
             )
         else:
             remedy = (
-                " Set on_matrix_change='reload' to rebuild and reload the matrix "
-                "(basis reset) for this solve instead of failing."
+                " Set on_matrix_change='patch' to patch the changed entries in "
+                "place (basis kept), or on_matrix_change='reload' to rebuild and "
+                "reload the whole matrix (basis reset), instead of failing."
             )
         return IncompatibleModelError(
             f"The '{self.name}' warm interface detected a genuine change in "
@@ -1961,8 +2208,9 @@ class FastStepHighs:
             )
         else:
             remedy = (
-                " Set on_matrix_change='reload' to re-fold, rebuild the templates, "
-                "and reload the model (basis reset) for this solve instead of "
+                " Set on_matrix_change='patch' to re-template just the affected "
+                "rows in place (basis kept), or on_matrix_change='reload' to "
+                "re-fold and reload the whole model (basis reset), instead of "
                 "failing."
             )
         return IncompatibleModelError(
@@ -2228,50 +2476,117 @@ class FastStepHighs:
                     "model instead (omit param_values)."
                 )
 
+        array_mode = param_values is not None
+        policy = self._on_matrix_change
+
         # --- verified-static parameter fold guard: never solve stale templates - #
         # A folded parameter had its set_instance value baked into every template
         # that referenced it (a ``price*duration`` objective coefficient became
         # ``duration_value * price``).  If a folded value genuinely changed, those
         # templates are stale by construction -- verify (vectorized) before
         # touching the solver.  Unchanged -> the fast path; changed -> fail loud,
-        # or (opt-in) re-fold + re-template + fresh passModel; never a stale solve.
+        # (opt-in) re-fold + re-template + fresh passModel, or (opt-in) a *partial
+        # refold* that re-templates just the affected rows in place and keeps the
+        # basis.  Never a stale solve.
+        refolded = False
         if plan.folded_params:
             fcur = plan.read_folded_vector()
             fchanged = np.abs(fcur - plan.folded_baseline) > (
                 self._matrix_atol + self._matrix_rtol * np.abs(plan.folded_baseline)
             )
             if fchanged.any():
-                array_mode = param_values is not None
-                if self._on_matrix_change == 'reload' and not array_mode:
+                if policy == 'error' or array_mode:
+                    # The array-driven path re-derives templates from the model, so
+                    # it cannot patch/reload a folded change (the model's varying
+                    # params may not reflect the array) -- always fatal there.
+                    raise self._folded_change_error(plan, fchanged, fcur, array_mode)
+                if policy == 'reload':
                     # Re-classify folds at the new values, rebuild the templates,
                     # and load a fresh model (basis reset) for this solve.  The
                     # fresh compile bakes in the current data, so the incremental
                     # push below is skipped (the overlay is re-applied by reload).
                     self._reload_full()
                     return
-                raise self._folded_change_error(plan, fchanged, fcur, array_mode)
+                # policy == 'patch': a partial refold, or degrade to reload when the
+                # change is too dense or touches the (un-patchable) Hessian.
+                changed_folded_ids = frozenset(
+                    id(plan.folded_params[int(k)]) for k in np.nonzero(fchanged)[0]
+                )
+                if changed_folded_ids & plan.hessian_folded_ids:
+                    logger.info(
+                        "%s: a folded parameter feeding the objective Hessian "
+                        "changed; the Hessian is not templated, so patching "
+                        "degrades to a full reload.",
+                        self.name,
+                    )
+                    self._reload_full()
+                    return
+                n_folded_affected = sum(
+                    tgt.count_affected(changed_folded_ids)
+                    for tgt in plan.refold_targets
+                )
+                if n_folded_affected > self._patch_max_resolved:
+                    logger.info(
+                        "%s: a folded change touches %d template entries "
+                        "(> patch_max_entries=%d); degrading to a full reload.",
+                        self.name,
+                        n_folded_affected,
+                        self._patch_max_resolved,
+                    )
+                    self._reload_full()
+                    return
+                self._refold_templates(changed_folded_ids, P, hinf)
+                plan.folded_baseline = fcur
+                refolded = True
 
         # --- value-aware static-matrix guard: never solve a stale matrix ------ #
         # Re-evaluate the mutable matrix coefficients (vectorized) and compare to
-        # the values HiGHS holds.  Unchanged -> the retained matrix is still
-        # correct, keep the warm basis (the fast path).  Changed -> fail loud, or
-        # (opt-in) reload; never a stale-matrix solve.
+        # the values HiGHS holds (the guard template already reflects any refold
+        # above, so a folded change to a matrix entry surfaces here too).
+        # Unchanged -> the retained matrix is still correct, keep the warm basis
+        # (the fast path).  Changed -> fail loud, (opt-in) reload, or (opt-in)
+        # patch the changed entries in place with the basis kept.
         guard = plan.matrix_guard
         if guard is not None and not guard.is_empty:
             current = guard.current(P, hinf)
             changed = guard.changed_mask(current, self._matrix_atol, self._matrix_rtol)
             if changed.any():
-                array_mode = param_values is not None
-                if self._on_matrix_change == 'reload' and not array_mode:
+                if policy == 'patch':
+                    n_changed = int(changed.sum())
+                    if n_changed > self._patch_max_resolved:
+                        # Too dense for a per-entry patch: degrade to a reload
+                        # (a full re-fold if the templates were already refolded).
+                        if array_mode:
+                            raise self._matrix_change_error(
+                                guard, changed, current, array_mode
+                            )
+                        logger.info(
+                            "%s: a matrix change touches %d entries "
+                            "(> patch_max_entries=%d); degrading to a reload.",
+                            self.name,
+                            n_changed,
+                            self._patch_max_resolved,
+                        )
+                        if refolded:
+                            self._reload_full()
+                        else:
+                            self._reload_model(P, hinf)
+                        return
+                    self._patch_matrix(highs, guard, changed, current)
+                elif policy == 'reload' and not array_mode:
                     # Rebuild + reload the whole standard-form matrix (basis
                     # reset) for this solve, then continue.  The fresh compile
                     # bakes in the current matrix *and* data, so the incremental
                     # push below is skipped (the overlay is re-applied by reload).
                     self._reload_model(P, hinf)
                     return
-                raise self._matrix_change_error(guard, changed, current, array_mode)
+                else:
+                    raise self._matrix_change_error(guard, changed, current, array_mode)
 
-        if dirty is not None:
+        # A partial refold re-templated rows outside the dirty set (a folded change
+        # is not a varying-parameter dirty column), so a refolded solve pushes the
+        # full templated data rather than the dirty subset.
+        if dirty is not None and not refolded:
             dirty_cols = np.nonzero(np.asarray(dirty, dtype=bool))[0]
             self._push_dirty(highs, plan, P, hinf, dirty_cols)
             self._push_overlay(highs, hinf)
@@ -2334,6 +2649,66 @@ class FastStepHighs:
                 self._emit_col_bounds(highs, plan.col_idx[rows], lo, up)
 
     # ------------------------------------------------------------------ #
+    # warm coefficient patch -- partial refold + sparse changeCoeff
+    # ------------------------------------------------------------------ #
+    def _refold_templates(self, changed_folded_ids, P, hinf):
+        """Partial refold (the ``on_matrix_change='patch'`` folded path).
+
+        Re-template just the rows a genuine folded-parameter change touched, in
+        place, keeping the classification (a patched fold is still folded -- the
+        mapping updates its stored values).  Each affected row is re-derived with
+        the *same* fold set and parameter registry ``set_instance`` used, then
+        validated against a fresh ``value()`` at the model's current state -- the
+        same fail-loud gate ``set_instance`` applies, restricted to the affected
+        subset -- so a patch is never a stale (or wrong) template.
+
+        Only the templates are updated here: the objective / bound groups are
+        re-pushed by the (full) templated push below the caller, and the matrix
+        guard's template is refolded too so its changed entries surface in
+        :meth:`_patch_matrix`.
+        """
+        plan = self._plan
+        for tgt in plan.refold_targets:
+            affected = tgt.affected_slots(changed_folded_ids)
+            if affected.size == 0:
+                continue
+            tgt.affine.refold_rows(
+                affected, tgt.slots, plan.param_index, plan.folded_ids
+            )
+            # Airtight gate: the refolded rows must reproduce a fresh value() at
+            # the model's current state (the folded params at their new values).
+            got = tgt.affine.compute_rows(affected, P, hinf)
+            ref = np.empty(affected.size, dtype=np.float64)
+            for k, i in enumerate(affected):
+                ref[k] = value(tgt.slots[int(i)])
+            np.clip(ref, -hinf, hinf, out=ref)
+            if not np.allclose(
+                got, ref, atol=_SELFCHECK_ATOL, rtol=_SELFCHECK_RTOL, equal_nan=False
+            ):
+                bad = int(np.argmax(np.abs(got - ref)))
+                raise IncompatibleModelError(
+                    f"The '{self.name}' warm interface partial refold could not "
+                    f"reproduce a coefficient after a folded change (template "
+                    f"{got[bad]!r} vs value() {ref[bad]!r}); the fold structure is "
+                    "not patchable.  Use on_matrix_change='reload'."
+                )
+
+    def _patch_matrix(self, highs, guard, changed, current):
+        """Patch the changed constraint-matrix coefficients in place, keeping the
+        warm basis.  HiGHS exposes no batch matrix-entry update, so this is a
+        bounded per-entry ``changeCoeff`` loop over just the changed entries (the
+        change-set is capped by ``patch_max_entries``; a per-entry patch is
+        measured to stay far cheaper than a whole-matrix reload up to that cap).
+        The guard is re-baselined to what HiGHS now holds so the next roll detects
+        the next change."""
+        idx = np.nonzero(changed)[0]
+        rows = guard.rows
+        cols = guard.cols
+        for k in idx:
+            highs.changeCoeff(int(rows[k]), int(cols[k]), float(current[int(k)]))
+        guard.baseline[idx] = current[idx]
+
+    # ------------------------------------------------------------------ #
     # parameter-vector introspection (the array/mapping-free contract)
     # ------------------------------------------------------------------ #
     @property
@@ -2386,6 +2761,7 @@ class FastStepHighs:
             'templated_parameters': templated,
             'folding_engaged': bool(folded),
             'on_folded_change': self._on_matrix_change,
+            'patch_max_entries': self._patch_max_resolved,
         }
 
     # ------------------------------------------------------------------ #

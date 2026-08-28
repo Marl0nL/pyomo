@@ -1,0 +1,47 @@
+{
+  "model": "coeff_patch_mpc",
+  "rows": [
+    {
+      "size": "day288",
+      "A": 6,
+      "T": 288,
+      "W": 48,
+      "n_col": 3456,
+      "n_row": 2016,
+      "nnz": 6906,
+      "cycles": 20,
+      "n_feasible_cycles": 20,
+      "entries_patched_per_tick": 6,
+      "guard_detect_us": 593.0234910920262,
+      "patch_apply_us": 10.209972970187664,
+      "patched_faststep_ms": 3.537716984283179,
+      "reload_faststep_ms": 36.71974904136732,
+      "classic_appsi_ms": 26.36387653183192,
+      "speedup_vs_reload": 10.379504410471537,
+      "speedup_vs_appsi": 7.452228838247171,
+      "max_window_obj_deviation": 1.1192150434825126e-15,
+      "equivalent": true
+    },
+    {
+      "size": "1e5",
+      "A": 40,
+      "T": 640,
+      "W": 64,
+      "n_col": 51200,
+      "n_row": 26240,
+      "nnz": 102360,
+      "cycles": 20,
+      "n_feasible_cycles": 20,
+      "entries_patched_per_tick": 40,
+      "guard_detect_us": 7131.7144320346415,
+      "patch_apply_us": 47.28999920189381,
+      "patched_faststep_ms": 37.23859746241942,
+      "reload_faststep_ms": 522.7377514238469,
+      "classic_appsi_ms": 244.60114008979872,
+      "speedup_vs_reload": 14.03752523041141,
+      "speedup_vs_appsi": 6.568484227598694,
+      "max_window_obj_deviation": 3.861951653812478e-15,
+      "equivalent": true
+    }
+  ]
+}

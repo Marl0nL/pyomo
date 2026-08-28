@@ -1041,6 +1041,419 @@ class TestFastStepFolding(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# The shrinking-first-interval MPC: a state-of-charge recurrence whose per-interval
+# durations ``dur[t]`` are *mutable matrix coefficients* on the charge term.  A
+# receding-horizon controller shrinks only ``dur[0]`` (the current control
+# interval's remaining time) each tick -- a small, sparse matrix-coefficient change
+# that the value guard would otherwise force a full reload for.  Synthetic (a
+# generic MPC shape, no application-specific structure).
+# --------------------------------------------------------------------------- #
+def _shrinking_interval_model(A=2, T=5, durs=None):
+    m = pyo.ConcreteModel()
+    m.A = pyo.RangeSet(0, A - 1)
+    m.T = pyo.RangeSet(0, T - 1)
+    if durs is None:
+        durs = {t: 1.0 for t in range(T)}
+    m.dur = pyo.Param(m.T, initialize=durs, mutable=True)  # matrix coefficient
+    m.price = pyo.Param(m.T, initialize={t: 1.0 for t in range(T)}, mutable=True)
+    m.dem = pyo.Param(
+        m.A,
+        m.T,
+        initialize={(a, t): 0.5 for a in range(A) for t in range(T)},
+        mutable=True,
+    )
+    m.p = pyo.Var(m.A, m.T, domain=pyo.NonNegativeReals, bounds=(0, 5))
+    m.soc = pyo.Var(m.A, m.T, bounds=(0.0, 40.0))
+
+    def socrule(mm, a, t):
+        prev = 0.0 if t == 0 else mm.soc[a, t - 1]
+        return mm.soc[a, t] == prev + mm.dur[t] * mm.p[a, t] - mm.dem[a, t]
+
+    m.socc = pyo.Constraint(m.A, m.T, rule=socrule)
+    m.obj = pyo.Objective(
+        expr=sum(m.price[t] * m.p[a, t] for a in range(A) for t in range(T))
+        + 0.01 * sum(m.soc[a, t] for a in range(A) for t in range(T)),
+        sense=pyo.minimize,
+    )
+    return m
+
+
+@unittest.skipUnless(_deps, "highs_faststep requires numpy/scipy/highspy")
+class TestFastStepPatch(unittest.TestCase):
+    """``on_matrix_change='patch'``: a genuinely-changing guarded (folded or
+    matrix-templated) coefficient becomes a warm update (partial refold + sparse
+    ``changeCoeff``) instead of a fail-loud / full reload."""
+
+    def setUp(self):
+        import pyomo.contrib.vector  # noqa: F401
+        from pyomo.contrib.solver.common.results import TerminationCondition
+        from pyomo.contrib.solver.common.util import IncompatibleModelError
+
+        self.TC = TerminationCondition
+        self.Err = IncompatibleModelError
+
+    def _fresh(self, m):
+        return _fastload().solve(m.clone(), raise_exception_on_nonoptimal_result=False)
+
+    def _assert_obj_matches(self, res, ref, msg=""):
+        self.assertEqual(res.termination_condition, ref.termination_condition, msg)
+        if res.termination_condition == self.TC.convergenceCriteriaSatisfied:
+            self.assertAlmostEqual(
+                res.incumbent_objective,
+                ref.incumbent_objective,
+                delta=1e-6 * max(1.0, abs(ref.incumbent_objective)),
+                msg=msg,
+            )
+
+    def test_patch_is_a_valid_policy(self):
+        from pyomo.contrib.vector import FastStepHighs
+
+        FastStepHighs(on_matrix_change='patch')  # constructor accepts it
+        m = _matrix_param_model()
+        FastStepHighs().set_instance(m, on_matrix_change='patch')  # set_instance too
+
+    def test_matrix_coefficient_patch_matches_fresh(self):
+        # A varying matrix coefficient (dur) genuinely changes: patch it in place
+        # and match a fresh build, keeping the warm basis.
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _matrix_param_model()
+        s = FastStepHighs(on_matrix_change='patch')
+        s.set_instance(m)
+        s.solve()
+        for newdur in (2.0, 0.5, 1.3, 3.0):
+            m.dur = newdur
+            res = s.solve()
+            self._assert_obj_matches(res, self._fresh(m), f"dur={newdur}")
+
+    def test_shrinking_first_interval_sequence(self):
+        # The headline case: only dur[0] shrinks each tick (a sparse matrix change)
+        # while the rolling data (price/dem) also moves -- match a fresh build
+        # solve-for-solve, both basis modes.
+        from pyomo.contrib.vector import FastStepHighs
+
+        A, T = 3, 6
+        for keep_basis in (True, False):
+            durs = {t: 1.0 for t in range(T)}
+            m = _shrinking_interval_model(A=A, T=T, durs=dict(durs))
+            s = FastStepHighs(on_matrix_change='patch')
+            s.set_instance(m)
+            s.solve(keep_basis=keep_basis)
+            d0 = 1.0
+            for roll in range(8):
+                d0 *= 0.9  # first interval's remaining duration shrinks
+                m.dur[0] = d0
+                rng = np.random.default_rng(roll)
+                for t in range(T):
+                    m.price[t] = float(rng.uniform(0.5, 3.0))
+                    for a in range(A):
+                        m.dem[a, t] = float(rng.uniform(0.0, 1.0))
+                res = s.solve(keep_basis=keep_basis, raise_on_nonoptimal=False)
+                # a fresh reference at the same dur/price/dem
+                mref = _shrinking_interval_model(
+                    A=A, T=T, durs=dict(m.dur.extract_values())
+                )
+                rng = np.random.default_rng(roll)
+                for t in range(T):
+                    mref.price[t] = float(rng.uniform(0.5, 3.0))
+                    for a in range(A):
+                        mref.dem[a, t] = float(rng.uniform(0.0, 1.0))
+                self._assert_obj_matches(
+                    res,
+                    _fastload().solve(mref, raise_exception_on_nonoptimal_result=False),
+                    f"roll {roll} keep_basis={keep_basis}",
+                )
+
+    def test_matrix_patch_primal_values_match_unique_lp(self):
+        # A unique-optimum LP with a matrix coefficient that changes: not just the
+        # objective but the primal values must match a fresh build.
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = pyo.ConcreteModel()
+        m.a = pyo.Param(initialize=1.0, mutable=True)  # matrix coefficient
+        m.x = pyo.Var([0, 1], domain=pyo.NonNegativeReals, bounds=(0, 10))
+        m.c1 = pyo.Constraint(expr=m.a * m.x[0] + m.x[1] == 6)
+        m.c2 = pyo.Constraint(expr=m.x[0] - m.x[1] == 1)
+        m.obj = pyo.Objective(expr=m.x[0] + m.x[1])
+        s = FastStepHighs(on_matrix_change='patch')
+        s.set_instance(m)
+        s.solve()
+        for a in (2.0, 0.5, 1.7):
+            m.a = a
+            s.solve()
+            mref = m.clone()
+            _fastload().solve(mref)
+            for i in (0, 1):
+                self.assertAlmostEqual(
+                    pyo.value(m.x[i]), pyo.value(mref.x[i]), places=6, msg=f"a={a}"
+                )
+
+    def test_folded_change_patch_matches_fresh(self):
+        # A genuine change to a folded (verified-static) parameter: partial refold
+        # + patch, matching a fresh build (never a reload, basis kept).
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _folded_param_model(A=3, T=4)
+        s = FastStepHighs(on_matrix_change='patch')
+        s.set_instance(m)
+        s.solve()
+        for newdur in (0.75, 0.95, 0.6):
+            m.dur = newdur
+            res = s.solve()
+            self._assert_obj_matches(res, self._fresh(m), f"dur={newdur}")
+        # eff is folded (matrix + reciprocal); a change to it patches too.
+        for a in range(3):
+            for t in range(4):
+                m.eff[a, t] = 0.85
+        res = s.solve()
+        self._assert_obj_matches(res, self._fresh(m), "eff->0.85")
+
+    def test_folded_shrinking_sequence_with_rolling_data(self):
+        # A folded value that changes EVERY solve (the shrinking pattern) combined
+        # with a normal data roll -- match a fresh structurally-rebuilt reference
+        # solve-for-solve, both basis modes.
+        from pyomo.contrib.vector import FastStepHighs
+
+        for keep_basis in (True, False):
+            m = _folded_param_model(A=3, T=5)
+            s = FastStepHighs(on_matrix_change='patch')
+            s.set_instance(m)
+            s.solve(keep_basis=keep_basis)
+            dur = 0.5
+            for roll in range(6):
+                dur *= 0.9
+                m.dur = dur
+                _roll_folded_model(m, np.random.default_rng(roll))
+                res = s.solve(keep_basis=keep_basis, raise_on_nonoptimal=False)
+                mref = _folded_param_model(A=3, T=5, dur=dur)
+                _roll_folded_model(mref, np.random.default_rng(roll))
+                self._assert_obj_matches(
+                    res,
+                    _fastload().solve(mref, raise_exception_on_nonoptimal_result=False),
+                    f"roll {roll} keep_basis={keep_basis}",
+                )
+
+    def test_patch_keeps_classification_coherent(self):
+        # A patched fold is still folded: the classification is unchanged across a
+        # folded-value change (the mapping updates its stored values, not the set).
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _folded_param_model(A=2, T=3)
+        s = FastStepHighs(on_matrix_change='patch')
+        s.set_instance(m)
+        folded_before = set(s.folded_parameters)
+        templated_before = set(s.templated_parameters)
+        s.solve()
+        m.dur = 0.8
+        s.solve()
+        self.assertEqual(set(s.folded_parameters), folded_before)
+        self.assertEqual(set(s.templated_parameters), templated_before)
+
+    def test_patch_composes_with_masked_window(self):
+        # patch + row-mask / variable-fix overlay in ONE warm step: the reported
+        # window objective (minus the fixed constant) matches a fresh narrowed
+        # build at the changed matrix coefficient.
+        from pyomo.contrib.vector import FastStepHighs
+
+        A, T, W = 2, 6, 3
+        m = _shrinking_interval_model(A=A, T=T)
+        s = FastStepHighs(on_matrix_change='patch')
+        s.set_instance(m)
+        s.solve()
+
+        # window [a0, b): mask out-of-window rows, fix out-of-window vars to 0,
+        # anchor the boundary soc[*, a0-1].
+        a0, b = 2, 2 + W
+        n_row, n_col = s._compiled.n_row, s._compiled.n_col
+        socc_row = {
+            (a, t): s.row_indices(m.socc[a, t])[0] for a in range(A) for t in range(T)
+        }
+        p_col = {(a, t): s.column_index(m.p[a, t]) for a in range(A) for t in range(T)}
+        soc_col = {
+            (a, t): s.column_index(m.soc[a, t]) for a in range(A) for t in range(T)
+        }
+        active = np.zeros(n_row, dtype=bool)
+        fixed = np.ones(n_col, dtype=bool)
+        values = np.zeros(n_col, dtype=np.float64)
+        boundary = 0.3
+        for t in range(a0, b):
+            for a in range(A):
+                active[socc_row[a, t]] = True
+                fixed[p_col[a, t]] = False
+                fixed[soc_col[a, t]] = False
+        for a in range(A):
+            values[soc_col[a, a0 - 1]] = boundary
+
+        # change dur[a0] (an in-window matrix coefficient) AND narrow, one solve.
+        m.dur[a0] = 0.6
+        s.set_window(active_rows=active, fixed_cols=fixed, fixed_values=values)
+        res = s.solve(raise_on_nonoptimal=False)
+        window_obj = res.incumbent_objective - s.masked_objective_constant()
+
+        # fresh narrowed reference at the changed dur.
+        n = pyo.ConcreteModel()
+        n.A = pyo.RangeSet(0, A - 1)
+        n.W = pyo.RangeSet(a0, b - 1)
+        n.p = pyo.Var(n.A, n.W, domain=pyo.NonNegativeReals, bounds=(0, 5))
+        n.soc = pyo.Var(n.A, n.W, bounds=(0.0, 40.0))
+
+        def socrule(nn, a, t):
+            prev = boundary if t == a0 else nn.soc[a, t - 1]
+            return nn.soc[a, t] == prev + pyo.value(m.dur[t]) * nn.p[a, t] - 0.5
+
+        n.socc = pyo.Constraint(n.A, n.W, rule=socrule)
+        n.obj = pyo.Objective(
+            expr=sum(
+                1.0 * n.p[a, t] + 0.01 * n.soc[a, t]
+                for a in range(A)
+                for t in range(a0, b)
+            ),
+            sense=pyo.minimize,
+        )
+        rref = _fastload().solve(n, raise_exception_on_nonoptimal_result=False)
+        self.assertEqual(
+            res.termination_condition, self.TC.convergenceCriteriaSatisfied
+        )
+        self.assertAlmostEqual(
+            window_obj,
+            rref.incumbent_objective,
+            delta=1e-6 * max(1.0, abs(rref.incumbent_objective)),
+        )
+
+    def test_patch_degrades_to_reload_on_large_change(self):
+        # A change-set larger than patch_max_entries degrades to a full reload --
+        # still correct, never a per-entry storm.
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _folded_param_model(A=3, T=4)
+        s = FastStepHighs(on_matrix_change='patch', patch_max_entries=1)
+        s.set_instance(m)
+        s.solve()
+        m.dur = 0.9  # folded change touches many entries > 1 -> reload
+        res = s.solve()
+        self._assert_obj_matches(res, self._fresh(m), "degrade")
+        # classification stays coherent after the reload, and a subsequent static
+        # roll still matches.
+        _roll_folded_model(m, np.random.default_rng(5))
+        res = s.solve()
+        mref = _folded_param_model(A=3, T=4, dur=0.9)
+        _roll_folded_model(mref, np.random.default_rng(5))
+        self._assert_obj_matches(
+            res,
+            _fastload().solve(mref, raise_exception_on_nonoptimal_result=False),
+            "post-degrade roll",
+        )
+
+    def test_unchanged_value_takes_zero_cost_path(self):
+        # Under patch, a solve with no guarded change never touches the matrix (no
+        # spurious patch), matching repeated identical solves.
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _matrix_param_model()
+        s = FastStepHighs(on_matrix_change='patch')
+        s.set_instance(m)
+        base = None
+        for _ in range(6):
+            res = s.solve()
+            self.assertEqual(
+                res.termination_condition, self.TC.convergenceCriteriaSatisfied
+            )
+            if base is None:
+                base = res.incumbent_objective
+            else:
+                self.assertAlmostEqual(res.incumbent_objective, base, places=9)
+
+    def test_array_mode_matrix_patch_matches_model(self):
+        # The array-driven (mapping-free) path patches a varying matrix change
+        # too (no model access needed for a matrix patch).
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _matrix_param_model(T=4)
+        s = FastStepHighs(on_matrix_change='patch')
+        s.set_instance(m)
+        params = s.parameters
+        s.solve()
+        m.dur = 2.5
+        P = np.fromiter((p.value for p in params), np.float64, len(params))
+        res = s.solve(param_values=P)
+        self._assert_obj_matches(res, self._fresh(m), "array matrix patch")
+
+    def test_array_mode_folded_change_still_fatal_under_patch(self):
+        # A folded change cannot be re-derived from an array (the model's varying
+        # params may not reflect it), so it stays fatal in array mode even under
+        # patch.
+        from pyomo.contrib.vector import FastStepHighs
+
+        m = _folded_param_model()
+        s = FastStepHighs(on_matrix_change='patch')
+        s.set_instance(m)
+        params = s.parameters
+        s.solve()
+        m.dur = 0.8
+        P = np.fromiter((p.value for p in params), np.float64, len(params))
+        with self.assertRaises(self.Err):
+            s.solve(param_values=P)
+
+    def test_patch_hessian_folded_change_degrades(self):
+        # A folded parameter feeding the (un-templated) objective Hessian cannot be
+        # patched -- a change to it degrades to a full reload, still correct.
+        from pyomo.contrib.vector import FastStepHighs
+
+        def build(dur, price):
+            m = pyo.ConcreteModel()
+            m.dur = pyo.Param(initialize=dur, mutable=True)  # Hessian coefficient
+            m.price = pyo.Param(initialize=price, mutable=True)  # linear (templated)
+            m.x = pyo.Var(bounds=(-10, 10))
+            m.c = pyo.Constraint(expr=m.x >= -5)
+            m.obj = pyo.Objective(
+                expr=m.dur * m.x * m.x + m.price * m.x, sense=pyo.minimize
+            )
+            return m
+
+        m = build(1.0, 2.0)
+        s = FastStepHighs(on_matrix_change='patch')
+        s.set_instance(m)
+        self.assertIn('dur', s.folded_parameters)
+        s.solve()
+        m.price = 4.0  # templated change -> normal push
+        self._assert_obj_matches(s.solve(), self._fresh(m), "price")
+        m.dur = 2.0  # Hessian folded change -> degrade to reload
+        self._assert_obj_matches(s.solve(), self._fresh(m), "dur (Hessian)")
+
+    def test_patch_and_reload_agree_solve_for_solve(self):
+        # patch and reload are two routes to the same correct answer: on the same
+        # sequence they agree solve-for-solve (patch keeps the basis, reload resets
+        # it, but the optimum is identical).
+        from pyomo.contrib.vector import FastStepHighs
+
+        m_p = _folded_param_model(A=2, T=4)
+        m_r = _folded_param_model(A=2, T=4)
+        s_p = FastStepHighs(on_matrix_change='patch')
+        s_r = FastStepHighs(on_matrix_change='reload')
+        s_p.set_instance(m_p)
+        s_r.set_instance(m_r)
+        s_p.solve()
+        s_r.solve()
+        dur = 0.5
+        for roll in range(5):
+            dur *= 0.85
+            for mm in (m_p, m_r):
+                mm.dur = dur
+            _roll_folded_model(m_p, np.random.default_rng(roll))
+            _roll_folded_model(m_r, np.random.default_rng(roll))
+            rp = s_p.solve(raise_on_nonoptimal=False)
+            rr = s_r.solve(raise_on_nonoptimal=False)
+            self.assertEqual(rp.termination_condition, rr.termination_condition)
+            if rp.termination_condition == self.TC.convergenceCriteriaSatisfied:
+                self.assertAlmostEqual(
+                    rp.incumbent_objective,
+                    rr.incumbent_objective,
+                    delta=1e-6 * max(1.0, abs(rr.incumbent_objective)),
+                    msg=f"roll {roll}",
+                )
+
+
+# --------------------------------------------------------------------------- #
 # Compile-scaling refactor: the fold classifier and coefficient signatures were
 # rewritten for near-linear set_instance compile.  These tests lock that the
 # rewrite did not change *what* is compiled -- the coefficient signatures are
