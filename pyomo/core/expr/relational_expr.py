@@ -40,6 +40,45 @@ from pyomo.core.pyomoobject import PyomoObject
 
 # -------------------------------------------------------
 #
+# Index-predicate capture hook (opt-in; default OFF)
+#
+# -------------------------------------------------------
+#
+# By default, a non-constant relational expression raises when used in a
+# boolean context (an ``if``, a generator filter, a conditional expression).
+# The vectorized-construction fast path (``pyomo.contrib.vector``, Phase 3b)
+# wants to *capture* such a predicate symbolically -- e.g. the filter ``if
+# j != n`` in ``sum(m.x[j, n] for j in J if j != n)`` or the index conditional
+# ``m.s[n, t - 1] if t > 0 else 0`` -- when every operand is an index value (an
+# ``IndexTemplate`` / NPV expression, never a ``Var``), so it can evaluate the
+# predicate as a NumPy mask over the whole index set instead of falling back to
+# per-index construction.
+#
+# ``_index_predicate_bool_hook`` is that opt-in hook.  It is ``None`` in stock
+# Pyomo (so ``__bool__`` behaves exactly as before), and is installed only for
+# the duration of a vectorized templatization.  When set, it is called as
+# ``hook(relational_expr)`` and must return either the ``bool`` the boolean
+# context should observe (after recording the predicate) or ``None`` to decline
+# (the normal "cannot convert to bool" error is then raised, i.e. the family
+# falls back to classic construction).
+_index_predicate_bool_hook = None
+
+
+def set_index_predicate_bool_hook(hook):
+    """Install (or clear, with ``None``) the index-predicate ``__bool__`` hook.
+
+    Returns the previous hook so it can be restored.  See the module comment
+    above; used only by ``pyomo.core.expr.template_expr`` under the opt-in
+    vectorized-construction switch.
+    """
+    global _index_predicate_bool_hook
+    prev = _index_predicate_bool_hook
+    _index_predicate_bool_hook = hook
+    return prev
+
+
+# -------------------------------------------------------
+#
 # Expression classes
 #
 # -------------------------------------------------------
@@ -85,6 +124,10 @@ class RelationalExpression(ExpressionBase, BooleanValue):
     def __bool__(self):
         if self.is_constant():
             return bool(self())
+        if _index_predicate_bool_hook is not None:
+            ans = _index_predicate_bool_hook(self)
+            if ans is not None:
+                return ans
         raise PyomoException("""
 Cannot convert non-constant Pyomo expression (%s) to bool.
 This error is usually caused by using a Var, unit, or mutable Param in a
@@ -466,6 +509,14 @@ class EqualityExpression(RelationalExpression):
         return 2
 
     def __bool__(self):
+        # Note: the index-predicate capture hook must win over the ``lhs is
+        # rhs`` identity short-circuit -- a captured ``==`` predicate compares
+        # index *values*, and distinct IndexTemplate objects can still name
+        # equal index values over the set.
+        if _index_predicate_bool_hook is not None and not self.is_constant():
+            ans = _index_predicate_bool_hook(self)
+            if ans is not None:
+                return ans
         lhs, rhs = self.args
         if lhs is rhs:
             return True
@@ -492,6 +543,12 @@ class NotEqualExpression(RelationalExpression):
         return 2
 
     def __bool__(self):
+        # See EqualityExpression.__bool__: the capture hook wins over the
+        # identity short-circuit (a captured ``!=`` predicate is by value).
+        if _index_predicate_bool_hook is not None and not self.is_constant():
+            ans = _index_predicate_bool_hook(self)
+            if ans is not None:
+                return ans
         lhs, rhs = self.args
         if lhs is not rhs:
             return True

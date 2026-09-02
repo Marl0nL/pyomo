@@ -726,7 +726,9 @@ class Constraint(ActiveIndexedComponent):
                     template_info = None
                     try:
                         with suppress_templatization_errors():
-                            template_info = templatize_constraint(self)
+                            template_info = templatize_constraint(
+                                self, capture_predicates=True
+                            )
                     except Exception:
                         # Templatization is an opportunistic fast path.  A rule
                         # that does not templatize -- index conditionals

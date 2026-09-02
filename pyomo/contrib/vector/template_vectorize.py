@@ -374,6 +374,40 @@ def _resolve_index(node, axis_vals, m):
     return np.asarray(v, dtype=np.int64)
 
 
+def _eval_predicate(node, axis_vals, m):
+    """Evaluate an index-value predicate to a boolean array of length ``m``.
+
+    Supports the comparison / conjunction predicates Phase 3b captures for
+    filtered sums and index conditionals: ``==``, ``!=``, ``<``, ``<=``, ``>``,
+    ``>=`` (and ranged ``a <= x <= b``) over affine index expressions.  Raises
+    :class:`NotVectorizable` for anything else (a variable predicate, an
+    unrecognised boolean combination) so the family falls back to classic.
+    """
+    if isinstance(node, rel.EqualityExpression):
+        a, b = node.args
+        return _resolve_index(a, axis_vals, m) == _resolve_index(b, axis_vals, m)
+    if isinstance(node, rel.NotEqualExpression):
+        a, b = node.args
+        return _resolve_index(a, axis_vals, m) != _resolve_index(b, axis_vals, m)
+    if isinstance(node, rel.RangedExpression):
+        lb_node, x_node, ub_node = node.args
+        strict = node.strict
+        xv = _resolve_index(x_node, axis_vals, m)
+        lbv = _resolve_index(lb_node, axis_vals, m)
+        ubv = _resolve_index(ub_node, axis_vals, m)
+        lo = lbv < xv if strict[0] else lbv <= xv
+        hi = xv < ubv if strict[1] else xv <= ubv
+        return lo & hi
+    if isinstance(node, rel.InequalityExpression):
+        a, b = node.args
+        av = _resolve_index(a, axis_vals, m)
+        bv = _resolve_index(b, axis_vals, m)
+        return av < bv if node.strict else av <= bv
+    raise NotVectorizable(
+        f"unsupported filter/conditional predicate {type(node).__name__}"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Family extraction
 # --------------------------------------------------------------------------- #
@@ -396,7 +430,7 @@ def _get_template_info(con):
         if info is not None:
             return info
     with suppress_templatization_errors():
-        return templatize_constraint(con)
+        return templatize_constraint(con, capture_predicates=True)
 
 
 class _FamilyExtractor:
@@ -410,14 +444,25 @@ class _FamilyExtractor:
         self.cols = []
         self.data = []
 
-    def _grid_axes(self, row_axis, row_ids, local_iters):
-        """Build the row x (cartesian product of local sets) grid.
+    def _grid_axes(self, row_axis, row_ids, local_iters, local_filters):
+        """Build the row x (cartesian product of local sets) grid, masked.
 
         Returns ``(m, row_index_of_entry, axis_vals)`` where ``axis_vals`` maps
-        every template id (row + local) to its value array over the grid.
+        every template id (row + local) to its value array over the *surviving*
+        grid entries.  ``local_filters`` (Phase 3b) is a flat list of index-value
+        predicates from every enclosing filtered sum; they are evaluated over the
+        full grid as a conjunction and only the entries where they all hold are
+        kept (the "masked / gathered" extraction).  With no local sets the grid
+        is just the rows; a filter there is a row mask (index conditionals).
         """
         if not local_iters:
-            return len(row_ids), row_ids, row_axis
+            if not local_filters:
+                return len(row_ids), row_ids, row_axis
+            m = len(row_ids)
+            mask = self._filter_mask(local_filters, row_axis, m)
+            keep = np.nonzero(mask)[0]
+            axis_vals = {tid: arr[keep] for tid, arr in row_axis.items()}
+            return keep.shape[0], row_ids[keep], axis_vals
         set_arrays = []
         tmpl_groups = []
         for tmpl_group, _set in local_iters:
@@ -430,12 +475,30 @@ class _FamilyExtractor:
             level = mesh[gi + 1].ravel()
             for t in tmpl_group:
                 axis_vals[id(t)] = level
-        return row_of_entry.shape[0], row_of_entry, axis_vals
+        m = row_of_entry.shape[0]
+        if local_filters:
+            mask = self._filter_mask(local_filters, axis_vals, m)
+            keep = np.nonzero(mask)[0]
+            row_of_entry = row_of_entry[keep]
+            axis_vals = {tid: arr[keep] for tid, arr in axis_vals.items()}
+            m = keep.shape[0]
+        return m, row_of_entry, axis_vals
 
-    def add_var_term(self, coef, getitem, sign, row_axis, row_ids, local_iters):
+    @staticmethod
+    def _filter_mask(local_filters, axis_vals, m):
+        """Conjunction of the filter predicates as a boolean array of length m."""
+        mask = np.ones(m, dtype=bool)
+        for pred in local_filters:
+            mask &= _eval_predicate(pred, axis_vals, m)
+        return mask
+
+    def add_var_term(self, coef, getitem, sign, row_axis, row_ids, local_iters,
+                     local_filters):
         var = getitem.args[0]
         idx_exprs = getitem.args[1:]
-        m, row_of_entry, axis_vals = self._grid_axes(row_axis, row_ids, local_iters)
+        m, row_of_entry, axis_vals = self._grid_axes(
+            row_axis, row_ids, local_iters, local_filters
+        )
         dim_arrays = [_resolve_index(ie, axis_vals, m) for ie in idx_exprs]
         mapper = self.mappers[id(var)]
         cols = mapper.map(dim_arrays) + self.col_offset[id(var)]
@@ -443,16 +506,19 @@ class _FamilyExtractor:
         self.cols.append(cols)
         self.data.append(np.full(m, float(coef) * sign))
 
-    def walk(self, node, sign, row_axis, row_ids, local_iters):
+    def walk(self, node, sign, row_axis, row_ids, local_iters, local_filters):
         """Append variable terms; return a per-row (or scalar) constant array.
 
         A variable term becomes matrix entries; a constant / mutable-Param term
         becomes a right-hand-side contribution (moved to the row bounds).
+        ``local_filters`` carries the predicates of every enclosing filtered sum.
         """
         if isinstance(node, GetItemExpression):
             comp = node.args[0]
             if comp.ctype is Var:
-                self.add_var_term(1.0, node, sign, row_axis, row_ids, local_iters)
+                self.add_var_term(
+                    1.0, node, sign, row_axis, row_ids, local_iters, local_filters
+                )
                 return 0.0
             # Param (or other data component) look-up -> constant contribution.
             if local_iters:
@@ -463,15 +529,22 @@ class _FamilyExtractor:
             summand = targs[0]
             sets = targs[1:]
             iters = list(zip(node.template_iters(), sets))
-            return self.walk(summand, sign, row_axis, row_ids, local_iters + iters)
+            filt = node.template_filter()
+            new_filters = local_filters + list(filt) if filt else local_filters
+            return self.walk(
+                summand, sign, row_axis, row_ids, local_iters + iters, new_filters
+            )
         if isinstance(node, ne.NegationExpression):
-            return self.walk(node.args[0], -sign, row_axis, row_ids, local_iters)
+            return self.walk(
+                node.args[0], -sign, row_axis, row_ids, local_iters, local_filters
+            )
         if isinstance(node, ne.MonomialTermExpression):
             coef, var_getitem = node.args
             if not isinstance(var_getitem, GetItemExpression):
                 raise NotVectorizable("monomial term is not a templated variable")
             self.add_var_term(
-                _const_coef(coef), var_getitem, sign, row_axis, row_ids, local_iters
+                _const_coef(coef), var_getitem, sign, row_axis, row_ids,
+                local_iters, local_filters,
             )
             return 0.0
         if isinstance(node, (ne.ProductExpression, ne.NPV_ProductExpression)):
@@ -482,12 +555,14 @@ class _FamilyExtractor:
                 raise NotVectorizable("product of two variables (nonlinear)")
             if b_is_var:
                 self.add_var_term(
-                    _const_coef(a), b, sign, row_axis, row_ids, local_iters
+                    _const_coef(a), b, sign, row_axis, row_ids,
+                    local_iters, local_filters,
                 )
                 return 0.0
             if a_is_var:
                 self.add_var_term(
-                    _const_coef(b), a, sign, row_axis, row_ids, local_iters
+                    _const_coef(b), a, sign, row_axis, row_ids,
+                    local_iters, local_filters,
                 )
                 return 0.0
             # constant * constant
@@ -499,7 +574,9 @@ class _FamilyExtractor:
         ):
             const = 0.0
             for a in node.args:
-                const = const + self.walk(a, sign, row_axis, row_ids, local_iters)
+                const = const + self.walk(
+                    a, sign, row_axis, row_ids, local_iters, local_filters
+                )
             return const
         # A bare numeric constant / Param scalar.
         if local_iters:
@@ -600,6 +677,28 @@ def _as_row_array(val, n):
     return np.asarray(val, dtype=np.float64)
 
 
+def _template_has_var(node):
+    """True if a template expression references any ``Var`` (vs. constant only).
+
+    Used to orient a relation (which side is the variable body, which is the
+    constant bound) so the extracted row keeps the body's natural coefficient
+    sign, matching the stock standard form.
+    """
+    if isinstance(node, GetItemExpression):
+        return node.args[0].ctype is Var
+    if isinstance(node, TemplateSumExpression):
+        return _template_has_var(node.template_args()[0])
+    if isinstance(node, IndexTemplate) or node.__class__ in (int, float):
+        return False
+    args = getattr(node, 'args', None)
+    if args is None:
+        return False
+    try:
+        return any(_template_has_var(a) for a in args)
+    except (TypeError, AttributeError):
+        return False
+
+
 def extract_family(con, col_offset, mappers, template_info=None):
     """Extract ``(rows, cols, data, row_lb, row_ub, nrows)`` for one family.
 
@@ -639,21 +738,48 @@ def extract_family(con, col_offset, mappers, template_info=None):
 
     if isinstance(expr, rel.EqualityExpression):
         lhs, rhs = expr.args
-        c_lhs = _as_row_array(ex.walk(lhs, 1.0, row_axis, row_ids, []), n)
-        c_rhs = _as_row_array(ex.walk(rhs, -1.0, row_axis, row_ids, []), n)
-        rhs_val = -(c_lhs + c_rhs)
+        lhs_var = _template_has_var(lhs)
+        rhs_var = _template_has_var(rhs)
+        if lhs_var != rhs_var:
+            # One side is the (variable) body, the other a constant bound.  Keep
+            # the body's natural coefficient sign (matches the stock standard
+            # form) instead of flipping the whole row.
+            body, bound = (lhs, rhs) if lhs_var else (rhs, lhs)
+            c_body = _as_row_array(ex.walk(body, 1.0, row_axis, row_ids, [], []), n)
+            c_bound = _as_row_array(ex.walk(bound, 1.0, row_axis, row_ids, [], []), n)
+            rhs_val = c_bound - c_body
+        else:
+            c_lhs = _as_row_array(ex.walk(lhs, 1.0, row_axis, row_ids, [], []), n)
+            c_rhs = _as_row_array(ex.walk(rhs, -1.0, row_axis, row_ids, [], []), n)
+            rhs_val = -(c_lhs + c_rhs)
         row_lb = rhs_val.copy()
         row_ub = rhs_val.copy()
     elif isinstance(expr, rel.InequalityExpression):
         lhs, rhs = expr.args
-        c_lhs = _as_row_array(ex.walk(lhs, 1.0, row_axis, row_ids, []), n)
-        c_rhs = _as_row_array(ex.walk(rhs, -1.0, row_axis, row_ids, []), n)
-        # lhs <= rhs  ->  (lhs_vars - rhs_vars) <= (rhs_const - lhs_const)
-        row_ub = -(c_lhs + c_rhs)
-        row_lb = np.full(n, _ninf)
+        lhs_var = _template_has_var(lhs)
+        rhs_var = _template_has_var(rhs)
+        if rhs_var and not lhs_var:
+            # bound <= body  (a ``>=`` on the body): lower bound, body's natural
+            # (positive) coefficients -- mirror the stock standard form.
+            c_body = _as_row_array(ex.walk(rhs, 1.0, row_axis, row_ids, [], []), n)
+            c_bound = _as_row_array(ex.walk(lhs, 1.0, row_axis, row_ids, [], []), n)
+            row_lb = c_bound - c_body
+            row_ub = np.full(n, _inf)
+        elif lhs_var and not rhs_var:
+            # body <= bound: upper bound, body's natural coefficients.
+            c_body = _as_row_array(ex.walk(lhs, 1.0, row_axis, row_ids, [], []), n)
+            c_bound = _as_row_array(ex.walk(rhs, 1.0, row_axis, row_ids, [], []), n)
+            row_ub = c_bound - c_body
+            row_lb = np.full(n, _ninf)
+        else:
+            # variables on both sides: lhs - rhs <= 0
+            c_lhs = _as_row_array(ex.walk(lhs, 1.0, row_axis, row_ids, [], []), n)
+            c_rhs = _as_row_array(ex.walk(rhs, -1.0, row_axis, row_ids, [], []), n)
+            row_ub = -(c_lhs + c_rhs)
+            row_lb = np.full(n, _ninf)
     elif isinstance(expr, rel.RangedExpression):
         lb_node, body, ub_node = expr.args
-        c_body = _as_row_array(ex.walk(body, 1.0, row_axis, row_ids, []), n)
+        c_body = _as_row_array(ex.walk(body, 1.0, row_axis, row_ids, [], []), n)
         lb_arr = _as_row_array(_eval_bound(lb_node, row_axis, n), n)
         ub_arr = _as_row_array(_eval_bound(ub_node, row_axis, n), n)
         row_lb = lb_arr - c_body
@@ -691,7 +817,9 @@ def extract_objective(obj_data, c, col_offset, mappers, template_info):
     """
     body, _idx_tmpls = template_info
     ex = _FamilyExtractor(obj_data, col_offset, mappers)
-    const = _as_row_array(ex.walk(body, 1.0, {}, np.zeros(1, dtype=np.int64), []), 1)
+    const = _as_row_array(
+        ex.walk(body, 1.0, {}, np.zeros(1, dtype=np.int64), [], []), 1
+    )
     for cols, dd in zip(ex.cols, ex.data):
         np.add.at(c, cols, dd)
     return float(const[0])

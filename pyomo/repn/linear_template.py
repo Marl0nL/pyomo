@@ -22,10 +22,13 @@ from pyomo.common.errors import (
 from pyomo.common.numeric_types import native_types, native_numeric_types
 
 import pyomo.core.expr as expr
+import pyomo.core.expr.numeric_expr as numeric_expr
+import pyomo.core.expr.relational_expr as relational_expr
 import pyomo.repn.linear as linear
 
 from pyomo.core.base.indexed_component import IndexedComponent
 from pyomo.core.expr import ExpressionType
+from pyomo.core.expr.template_expr import IndexTemplate
 from pyomo.repn.linear import LinearRepn
 from pyomo.repn.util import ExprType, initialize_exit_node_dispatcher, val2str
 
@@ -34,6 +37,63 @@ _VARIABLE = ExprType.VARIABLE
 _LINEAR = ExprType.LINEAR
 
 code_type = deepcopy.__class__
+
+
+def _predicate_to_pystr(node, smap):
+    """Render an index-value predicate/expression as a Python source string.
+
+    Used to emit the ``if <filter>:`` guard for a Phase-3b filtered sum in the
+    generated template evaluator.  Handles the captured comparison predicates
+    (``==``, ``!=``, ``<``, ``<=``, ranged) over affine index expressions
+    (IndexTemplate leaves rendered with their loop/row symbol via ``smap``).
+    """
+    cls = node.__class__
+    if cls is IndexTemplate:
+        return smap.getSymbol(node)
+    if cls in native_types:
+        return repr(node)
+    if isinstance(node, relational_expr.EqualityExpression):
+        a, b = node.args
+        return f"({_predicate_to_pystr(a, smap)} == {_predicate_to_pystr(b, smap)})"
+    if isinstance(node, relational_expr.NotEqualExpression):
+        a, b = node.args
+        return f"({_predicate_to_pystr(a, smap)} != {_predicate_to_pystr(b, smap)})"
+    if isinstance(node, relational_expr.RangedExpression):
+        lb, x, ub = node.args
+        s = node.strict
+        lo = "<" if s[0] else "<="
+        hi = "<" if s[1] else "<="
+        return (
+            f"({_predicate_to_pystr(lb, smap)} {lo} {_predicate_to_pystr(x, smap)}"
+            f" {hi} {_predicate_to_pystr(ub, smap)})"
+        )
+    if isinstance(node, relational_expr.InequalityExpression):
+        a, b = node.args
+        op = "<" if node.strict else "<="
+        return f"({_predicate_to_pystr(a, smap)} {op} {_predicate_to_pystr(b, smap)})"
+    if isinstance(node, numeric_expr.NegationExpression):
+        return f"(-{_predicate_to_pystr(node.args[0], smap)})"
+    if isinstance(
+        node,
+        (
+            numeric_expr.SumExpression,
+            numeric_expr.LinearExpression,
+            numeric_expr.NPV_SumExpression,
+        ),
+    ):
+        return "(" + " + ".join(_predicate_to_pystr(a, smap) for a in node.args) + ")"
+    if isinstance(
+        node,
+        (
+            numeric_expr.MonomialTermExpression,
+            numeric_expr.ProductExpression,
+            numeric_expr.NPV_ProductExpression,
+        ),
+    ):
+        a, b = node.args
+        return f"({_predicate_to_pystr(a, smap)} * {_predicate_to_pystr(b, smap)})"
+    # Any other node must be a compile-time constant (e.g. a fixed Param value).
+    return val2str(node)
 
 
 class LinearTemplateRepn(LinearRepn):
@@ -50,7 +110,7 @@ class LinearTemplateRepn(LinearRepn):
             + "}"
         )
         linear_sum = []
-        for subrepn, subind, subsets in self.linear_sum:
+        for subrepn, subind, subsets, *_ in self.linear_sum:
             linear_sum.append(
                 val2str(subrepn)
                 + ", ["
@@ -159,15 +219,20 @@ class LinearTemplateRepn(LinearRepn):
                 ans.append(indent + f'linear_indices.append({k})')
                 ans.append(indent + f'linear_data.append({coef})')
 
-        for subrepn, subindices, subsets in self.linear_sum:
+        for subrepn, subindices, subsets, *_filt in self.linear_sum:
+            subfilter = _filt[0] if _filt else None
             try:
                 subrep = 1
                 for _set in subsets:
                     subrep *= len(_set)
             except:
                 subrep = 0
+            # Phase 3b: a filtered sum's surviving-term count is not known at
+            # compile time, so constants inside it cannot be pre-multiplied by
+            # the set size -- force them to accumulate per surviving iteration
+            # (repetitions=0) inside the emitted ``if <filter>:`` guard.
             subans, subconst = subrepn._build_evaluator(
-                smap, expr_cache, multiplier, repetitions * subrep
+                smap, expr_cache, multiplier, 0 if subfilter else repetitions * subrep
             )
             if subans:
                 ans.extend(
@@ -182,6 +247,12 @@ class LinearTemplateRepn(LinearRepn):
                     for i, (_idx, _set) in enumerate(zip(subindices, subsets))
                 )
                 indent = '    ' * (len(subsets))
+                if subfilter:
+                    guard = ' and '.join(
+                        _predicate_to_pystr(p, smap) for p in subfilter
+                    )
+                    ans.append(indent + 'if ' + guard + ':')
+                    indent = indent + '    '
                 ans.extend(indent + line for line in subans)
             constant += subconst
         return ans, constant
@@ -332,7 +403,14 @@ def _handle_getitem(visitor, node, comp, *args):
 def _handle_templatesum(visitor, node, comp, *args):
     ans = visitor.Result()
     if comp[0] is _LINEAR:
-        ans.linear_sum.append((comp[1], node.template_iters(), [a[1] for a in args]))
+        ans.linear_sum.append(
+            (
+                comp[1],
+                node.template_iters(),
+                [a[1] for a in args],
+                node.template_filter(),
+            )
+        )
         return _LINEAR, ans
     else:
         raise DeveloperError(comp)
