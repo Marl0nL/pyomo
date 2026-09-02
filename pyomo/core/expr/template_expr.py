@@ -7,6 +7,7 @@
 # software.  This software is distributed under the 3-clause BSD License.
 # ____________________________________________________________________________________
 
+import dis
 import itertools
 import logging
 import sys
@@ -38,7 +39,10 @@ from pyomo.core.expr.numvalue import (
 )
 from pyomo.core.expr.relational_expr import (
     tuple_to_relational_expr,
+    EqualityExpression,
     NotEqualExpression,
+    InequalityExpression,
+    RangedExpression,
     set_index_predicate_bool_hook,
 )
 from pyomo.core.expr.visitor import (
@@ -117,6 +121,38 @@ class _IndexPredicateCapture:
         self.in_filter = 0
         self.conditional_policy = conditional_policy
         self.unsupported = False
+
+
+_COMPARISON_OPCODES = frozenset({'COMPARE_OP', 'CONTAINS_OP', 'IS_OP'})
+
+
+def _count_comparisons(code):
+    """Number of comparison opcodes in a (generator) code object."""
+    try:
+        return sum(
+            1 for i in dis.get_instructions(code) if i.opname in _COMPARISON_OPCODES
+        )
+    except TypeError:
+        return -1
+
+
+def _filter_is_pure_conjunction(generator, n_captured):
+    """True if the generator's filter is a pure conjunction of comparisons.
+
+    We capture a filter by making each comparison's ``__bool__`` return True, but
+    Python's ``or`` / ``not`` short-circuit, so a disjunction (``k < n or k > n``)
+    would silently capture only its first clause -- a wrong (too-permissive)
+    filter.  A conjunction (``a and b``, or chained ``if a if b``) instead
+    evaluates *every* comparison, so the count of comparison opcodes in the
+    generator equals the number of predicates we captured.  If they differ, the
+    filter short-circuited (an ``or`` / mixed boolean) and is not vectorizable as
+    a conjunction -- the caller falls back to classic construction.
+    """
+    code = getattr(generator, 'gi_code', None)
+    if code is None:
+        return False
+    ncomp = _count_comparisons(code)
+    return ncomp == n_captured
 
 
 def _index_predicate_hook(expr):
@@ -1293,6 +1329,17 @@ class _template_iter_context:
                 cap.in_filter -= 1
             _filter = tuple(cap.filters[filt_mark:]) or None
             del cap.filters[filt_mark:]
+            if _filter is not None and not _filter_is_pure_conjunction(
+                generator, len(_filter)
+            ):
+                # A disjunction / mixed-boolean filter short-circuited and we did
+                # not capture every comparison: reject so the family falls back
+                # to classic construction (rather than a wrong, too-loose mask).
+                raise TemplateExpressionError(
+                    None,
+                    "filtered sum with a non-conjunctive predicate "
+                    "(or / not / short-circuit) is not vectorizable",
+                )
         else:
             _filter = None
             expr = next(generator)
@@ -1441,22 +1488,153 @@ def templatize_rule(block, rule, index_set):
     return None, indices
 
 
+def _templatize_constraint_raw(con):
+    """``templatize_rule`` for a constraint, with the tuple -> relational fix.
+
+    Assumes any desired predicate-capture context is already active.
+    """
+    expr, indices = templatize_rule(con.parent_block(), con.rule, con.index_set())
+    if expr.__class__ is tuple:
+        expr = tuple_to_relational_expr(expr)
+    return expr, indices
+
+
 def templatize_constraint(con, capture_predicates=False):
     """Templatize a constraint family's rule.
 
     ``capture_predicates`` (Phase 3b, opt-in) enables index-predicate capture so
     a rule containing a filtered sum (``sum(... for j in J if j != n)``)
     templatizes into a filter-carrying ``TemplateSumExpression`` instead of
-    failing.  Index conditionals still fall back (no ``conditional_policy``); the
-    vectorized-construction path supplies one where it needs conditional cover.
+    failing.  Index conditionals still fall back (no ``conditional_policy``); use
+    :func:`masked_templatize_constraint` for conditional cover.
     """
     if capture_predicates:
         with capture_index_predicates():
-            expr, indices = templatize_rule(
-                con.parent_block(), con.rule, con.index_set()
+            return _templatize_constraint_raw(con)
+    return _templatize_constraint_raw(con)
+
+
+# Result-tag constants for masked_templatize_constraint.
+MASKED_PLAIN = 'plain'
+MASKED_CONDITIONAL = 'masked'
+_MAX_CONDITIONAL_PREDICATES = 6
+
+
+def masked_templatize_constraint(con):
+    """Templatize a rule that contains index conditionals, via polarity replay.
+
+    An index conditional -- ``(m.s[n, t - 1] if t > 0 else 0)`` or a guarded
+    ``if t == 0: return Constraint.Skip`` -- selects a *branch* by a predicate on
+    the row index.  Python evaluates only the taken branch, so a single
+    templatization cannot see both.  We therefore *replay* the rule once per
+    truth-assignment (polarity combination) of the conditional predicates it
+    contains, each replay forcing those predicates to fixed booleans and yielding
+    an ordinary (branch-free) template; at extraction each row uses the template
+    of the combination its index actually satisfies (and is dropped if that
+    combination returns ``Constraint.Skip``).  Filtered sums inside a branch are
+    captured as usual, so conditionals and filters compose.
+
+    Returns one of:
+
+    * ``(MASKED_PLAIN, (expr, indices))`` -- no index conditionals were found
+      (the rule templatized with filters only); the caller stores it as a plain
+      template.
+    * ``(MASKED_CONDITIONAL, (row_templates, predicates, combos))`` -- where
+      ``predicates`` is the ordered list of conditional predicates (over
+      ``row_templates``) and ``combos`` maps each truth-assignment tuple to a
+      plain ``(expr, indices)`` template or to ``Constraint.Skip``.
+
+    Raises (caller falls back to classic) if the conditional structure is not a
+    flat, index-only set of predicates -- e.g. a predicate that is not a pure
+    index comparison, more than :data:`_MAX_CONDITIONAL_PREDICATES` predicates,
+    or a structure whose predicate set changes with the branch taken (nested /
+    data-dependent conditionals).
+    """
+    from pyomo.core.base.indexed_component import IndexedComponent
+
+    Skip = IndexedComponent.Skip
+
+    # --- Pass 1: discovery (force every conditional False) ---------------- #
+    discovered = []
+
+    def discover(expr, cap):
+        discovered.append(expr)
+        return False
+
+    with capture_index_predicates(conditional_policy=discover) as cap:
+        info0 = _templatize_constraint_raw(con)
+        if cap.unsupported:
+            raise TemplateExpressionError(
+                None, "index conditional predicate is not vectorizable"
             )
-    else:
-        expr, indices = templatize_rule(con.parent_block(), con.rule, con.index_set())
-    if expr.__class__ is tuple:
-        expr = tuple_to_relational_expr(expr)
-    return expr, indices
+    k = len(discovered)
+    if k == 0:
+        return MASKED_PLAIN, info0
+    if k > _MAX_CONDITIONAL_PREDICATES:
+        raise TemplateExpressionError(
+            None, "too many index conditionals to vectorize (%d)" % (k,)
+        )
+    pred_signature = [p.to_string() for p in discovered]
+    row_templates = info0[1]
+
+    # --- Replay each polarity combination -------------------------------- #
+    combos = {(False,) * k: info0}
+    for bits in itertools.product((False, True), repeat=k):
+        if bits in combos:
+            continue
+        replay = {'preds': [], 'i': 0}
+
+        def force(expr, cap, _bits=bits, _r=replay):
+            _r['preds'].append(expr)
+            j = _r['i']
+            _r['i'] += 1
+            return _bits[j] if j < len(_bits) else False
+
+        with capture_index_predicates(conditional_policy=force) as cap:
+            infob = _templatize_constraint_raw(con)
+            if (
+                cap.unsupported
+                or replay['i'] != k
+                or [p.to_string() for p in replay['preds']] != pred_signature
+            ):
+                raise TemplateExpressionError(
+                    None, "inconsistent index-conditional structure"
+                )
+        combos[bits] = infob
+    return MASKED_CONDITIONAL, (row_templates, discovered, combos)
+
+
+def _scalar_predicate_value(pred):
+    """Evaluate one index predicate (templates already set) to a Python bool.
+
+    Note we evaluate *by value* rather than ``bool(pred)``: a NotEqualExpression's
+    ``__bool__`` short-circuits on object identity, which is not the index-value
+    comparison we need here.
+    """
+    if pred.__class__ is EqualityExpression:
+        return value(pred.args[0]) == value(pred.args[1])
+    if pred.__class__ is NotEqualExpression:
+        return value(pred.args[0]) != value(pred.args[1])
+    if pred.__class__ is InequalityExpression:
+        a, b = value(pred.args[0]), value(pred.args[1])
+        return a < b if pred.strict else a <= b
+    if pred.__class__ is RangedExpression:
+        lb, x, ub = (value(a) for a in pred.args)
+        s = pred.strict
+        return (lb < x if s[0] else lb <= x) and (x < ub if s[1] else x <= ub)
+    raise TemplateExpressionError(None, "unsupported index predicate")
+
+
+def evaluate_index_predicates(predicates, row_templates, index):
+    """Return the truth-assignment tuple of ``predicates`` at one row ``index``.
+
+    Sets the row IndexTemplates to the concrete index values and evaluates each
+    predicate.  This is a cheap O(1)-per-predicate scalar evaluation (no
+    expression-tree build, no template resolution of the body) used at construct
+    time to route each row to its polarity combination.
+    """
+    if index.__class__ is not tuple:
+        index = (index,)
+    for t, v in zip(row_templates, index):
+        t.set_value(v)
+    return tuple(_scalar_predicate_value(p) for p in predicates)

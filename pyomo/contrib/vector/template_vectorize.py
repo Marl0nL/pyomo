@@ -699,14 +699,15 @@ def _template_has_var(node):
         return False
 
 
-def extract_family(con, col_offset, mappers, template_info=None):
+def extract_family(con, col_offset, mappers, template_info=None, index_list=None):
     """Extract ``(rows, cols, data, row_lb, row_ub, nrows)`` for one family.
 
     ``col_offset`` maps ``id(var component) -> global column offset``; ``mappers``
     maps ``id(var component) -> _ColumnMapper``.  Raises :class:`NotVectorizable`
     if the family's body is outside the proven subset.  The CSR triplet is over
     the global column space; ``row_lb``/``row_ub`` are float arrays (``+/- inf``
-    on an open side).  Rows are in ``con.index_set()`` order.
+    on an open side).  Rows are in ``index_list`` order (``con.index_set()`` by
+    default; a subset for one polarity combination of a masked family).
     """
     if template_info is None:
         template_info = _get_template_info(con)
@@ -717,7 +718,8 @@ def extract_family(con, col_offset, mappers, template_info=None):
         # let the classic per-row path handle it (it is a single expression).
         raise NotVectorizable("scalar (unindexed) constraint")
 
-    index_list = list(con.index_set())
+    if index_list is None:
+        index_list = list(con.index_set())
     n = len(index_list)
     if n == 0:
         return (
@@ -1079,14 +1081,30 @@ def _extract_or_classic(con, col_offset, mappers, n_var):
     """
     if len(con) == 0:
         return scipy.sparse.csr_array((0, n_var)), np.zeros(0), np.zeros(0), []
+    masked = getattr(con, '_masked_template', None)
+    if masked is not None:
+        # Phase 3b: an index-conditional family -- route each row to the
+        # template of the polarity combination it satisfies (Skip combos are
+        # already absent from the family).
+        try:
+            return _extract_masked_family(con, col_offset, mappers, n_var, masked)
+        except NotVectorizable:
+            return _classic_family(con, col_offset, mappers, n_var)
+        except Exception as e:
+            if is_debug_set(logger):
+                logger.debug(
+                    "masked family '%s' not vectorizable (%s: %s); classic repn"
+                    % (con.name, type(e).__name__, e)
+                )
+            return _classic_family(con, col_offset, mappers, n_var)
     try:
         info = _get_template_info(con)
         rows, cols, data, lb, ub, nr = extract_family(con, col_offset, mappers, info)
     except NotVectorizable:
         return _classic_family(con, col_offset, mappers, n_var)
     except Exception as e:
-        # The rule did not templatize (index conditional / filtered sum /
-        # modulo / ...): use the proven classic path for this family.
+        # The rule did not templatize (modulo / non-affine indexing / an
+        # out-of-subset predicate / ...): use the proven classic path.
         if is_debug_set(logger):
             logger.debug(
                 "family '%s' not vectorizable (%s: %s); using classic per-row repn"
@@ -1097,6 +1115,65 @@ def _extract_or_classic(con, col_offset, mappers, n_var):
     A.sum_duplicates()
     meta = [(con, r) for r in range(nr)]
     return A, lb, ub, meta
+
+
+def _extract_masked_family(con, col_offset, mappers, n_var, masked):
+    """Vectorized extraction for an index-conditional (masked) family.
+
+    ``masked`` is ``(row_templates, predicates, combos)``.  Every row index is
+    routed -- vectorially, by evaluating the predicates over the whole index set
+    -- to the polarity combination it satisfies; each surviving combination's
+    ordinary template is extracted over just its rows (``extract_family`` with a
+    row subset) and the pieces are concatenated (row order is immaterial: the
+    equivalence check and the solver are permutation-invariant).
+    """
+    from pyomo.core.base.indexed_component import IndexedComponent
+
+    Skip = IndexedComponent.Skip
+    row_templates, predicates, combos = masked
+    index_list = list(con.index_set())
+    n = len(index_list)
+    if n == 0:
+        return scipy.sparse.csr_array((0, n_var)), np.zeros(0), np.zeros(0), []
+    row_vals = np.array(
+        [k if isinstance(k, tuple) else (k,) for k in index_list], dtype=np.int64
+    )
+    row_axis = {id(t): row_vals[:, k] for k, t in enumerate(row_templates)}
+    # Pack the k predicate truth values into an integer code per row so rows are
+    # bucketed by combination with a single np.unique.
+    code = np.zeros(n, dtype=np.int64)
+    for bit, pred in enumerate(predicates):
+        mask = np.asarray(_eval_predicate(pred, row_axis, n), dtype=bool)
+        code |= mask.astype(np.int64) << bit
+
+    A_parts, lb_parts, ub_parts = [], [], []
+    r_off = 0
+    meta = []
+    for c in np.unique(code):
+        bits = tuple(bool((int(c) >> b) & 1) for b in range(len(predicates)))
+        info = combos.get(bits)
+        if info is None or info[0] is Skip:
+            continue
+        sel = np.nonzero(code == c)[0]
+        sub_index = [index_list[s] for s in sel.tolist()]
+        rows, cols, data, lb, ub, nr = extract_family(
+            con, col_offset, mappers, info, index_list=sub_index
+        )
+        if nr == 0:
+            continue
+        A_sub = scipy.sparse.coo_array(
+            (data, (rows, cols)), shape=(nr, n_var)
+        ).tocsr()
+        A_sub.sum_duplicates()
+        A_parts.append(A_sub)
+        lb_parts.append(lb)
+        ub_parts.append(ub)
+        meta.extend((con, r_off + r) for r in range(nr))
+        r_off += nr
+    if not A_parts:
+        return scipy.sparse.csr_array((0, n_var)), np.zeros(0), np.zeros(0), []
+    A = scipy.sparse.vstack(A_parts, format='csr')
+    return A, np.concatenate(lb_parts), np.concatenate(ub_parts), meta
 
 
 def _classic_family(con, col_offset, mappers, n_var):
