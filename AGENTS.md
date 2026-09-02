@@ -8,11 +8,14 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 This fork carries a phased "Vectorized Model Construction for Pyomo" program under
 `pyomo/contrib/vector/`; feature work branches off the `vectorisation` branch (not
-`main`). Each phase has a report in `bench/` (`PHASE0..PHASE4_REPORT.md`) — read the
-relevant one before touching a phase. Phases: 1 columnar components, 2
-`highs_fastload` (cold `passModel` hand-off), 3 template construction, 4
-`highs_faststep` (`FastStepHighs`, array-native persistent **warm** re-solve for
-rolling-horizon / MPC). The Phase-3 construction switch (`vectorized_construction()`
+`main`). Each phase has a report in `bench/` (`PHASE0..PHASE4_REPORT.md`, plus
+`PHASE3B_REPORT.md`) — read the relevant one before touching a phase. Phases: 1
+columnar components, 2 `highs_fastload` (cold `passModel` hand-off), 3 template
+construction, 3b filtered-sum + index-conditional + `Constraint.Skip`
+templatization (a `__bool__` capture hook in `relational_expr.py` + polarity
+replay; `network_flow`'s body now vectorizes but its `sin(index)` RHS stays
+classic — `bench/PHASE3B_REPORT.md`), 4 `highs_faststep` (`FastStepHighs`,
+array-native persistent **warm** re-solve for rolling-horizon / MPC). The Phase-3 construction switch (`vectorized_construction()`
 / `PYOMO_VECTOR_CONSTRUCT`) also does **transparent columnar Var/Param
 construction** (`pyomo/contrib/vector/varparam.py`): a classic `Var`/`Param` with
 vectorizable args builds into NumPy columns (materialize-on-touch), skipping the

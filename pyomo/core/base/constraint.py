@@ -43,7 +43,11 @@ from pyomo.core.expr.relational_expr import (
 )
 from pyomo.core.expr.template_expr import (
     templatize_constraint,
+    masked_templatize_constraint,
+    evaluate_index_predicates,
     suppress_templatization_errors,
+    MASKED_PLAIN,
+    MASKED_CONDITIONAL,
 )
 from pyomo.core.base.component import ActiveComponentData, ModelComponentFactory
 from pyomo.core.base.global_set import UnindexedComponent_index
@@ -723,24 +727,25 @@ class Constraint(ActiveIndexedComponent):
                 pass
             else:
                 if TEMPLATIZE_CONSTRAINTS:
-                    template_info = None
+                    masked = None
                     try:
                         with suppress_templatization_errors():
-                            template_info = templatize_constraint(self)
+                            masked = masked_templatize_constraint(self)
                     except Exception:
                         # Templatization is an opportunistic fast path.  A rule
-                        # that does not templatize -- index conditionals
-                        # (``if i == 0``), filtered sums (``for j in J if
-                        # j != n``), modulo / non-affine indexing, unhashable
-                        # index-dependent lookups, etc. -- raises here (a
+                        # that does not templatize -- modulo / non-affine
+                        # indexing, unhashable index-dependent lookups, an
+                        # index-dependent coefficient, an out-of-subset predicate,
+                        # a transcendental of the index, etc. -- raises here (a
                         # TemplateExpressionError, or the PyomoException /
                         # TypeError / KeyError the rule itself produces when
-                        # called with IndexTemplate arguments).  On ANY such
-                        # failure we fall back to classic per-index
-                        # construction below, which is the ground truth and
-                        # will re-raise any genuine rule error with a concrete
-                        # index (scoping doc Sec 6.5; Phase-3 mandatory
-                        # scalarization fallback).
+                        # called with IndexTemplate arguments).  Phase 3b adds
+                        # filtered-sum and index-conditional cover, but anything
+                        # outside the proven subset still falls back to classic
+                        # per-index construction below, which is the ground truth
+                        # and will re-raise any genuine rule error with a concrete
+                        # index (scoping doc Sec 6.5; mandatory scalarization
+                        # fallback).
                         if is_debug_set(logger):
                             logger.debug(
                                 "Constraint %s did not templatize; falling back "
@@ -751,20 +756,35 @@ class Constraint(ActiveIndexedComponent):
                                     sys.exc_info()[1],
                                 )
                             )
-                        template_info = None
-                    if template_info is not None:
-                        if self.is_indexed():
-                            comp = weakref_ref(self)
-                            self._data = {
-                                idx: TemplateConstraintData(template_info, comp, idx)
-                                for idx in self.index_set()
-                            }
-                        else:
-                            assert self.__class__ is ScalarConstraint
-                            self.__class__ = TemplateScalarConstraint
-                            self._expr = template_info
-                            self._data = {None: self}
-                        return
+                        masked = None
+                    if masked is not None:
+                        tag, payload = masked
+                        if tag == MASKED_CONDITIONAL:
+                            # An index conditional: each row uses the template of
+                            # the polarity combination its index satisfies, and a
+                            # combination that returns Skip drops the row.  Only
+                            # supported for indexed families (a scalar conditional
+                            # is rare -- fall through to classic).
+                            if self.is_indexed() and self._build_masked_template(
+                                payload
+                            ):
+                                return
+                        else:  # MASKED_PLAIN: an ordinary (possibly filtered) template
+                            template_info = payload
+                            if self.is_indexed():
+                                comp = weakref_ref(self)
+                                self._data = {
+                                    idx: TemplateConstraintData(
+                                        template_info, comp, idx
+                                    )
+                                    for idx in self.index_set()
+                                }
+                            else:
+                                assert self.__class__ is ScalarConstraint
+                                self.__class__ = TemplateScalarConstraint
+                                self._expr = template_info
+                                self._data = {None: self}
+                            return
 
                 # Bypass the index validation and create the member directly
                 for index in self.index_set():
@@ -779,6 +799,40 @@ class Constraint(ActiveIndexedComponent):
             raise
         finally:
             timer.report()
+
+    def _build_masked_template(self, payload):
+        """Store an index-conditional (masked) template family (Phase 3b).
+
+        ``payload`` is ``(row_templates, predicates, combos)`` from
+        :func:`masked_templatize_constraint`.  Each row is routed to the template
+        of the polarity combination its index satisfies; a combination that
+        returns ``Constraint.Skip`` drops the row (matching classic
+        construction).  Every surviving row stores an *ordinary* template on its
+        ``TemplateConstraintData`` (so materialize-on-touch and the stock
+        template compiler work unchanged); the combination structure is recorded
+        on ``_masked_template`` for the vectorized extractor.  Returns True on
+        success.
+        """
+        row_templates, predicates, combos = payload
+        comp = weakref_ref(self)
+        data = {}
+        try:
+            for idx in self.index_set():
+                bits = evaluate_index_predicates(predicates, row_templates, idx)
+                info = combos.get(bits)
+                if info is None or info[0] is Constraint.Skip:
+                    continue
+                data[idx] = TemplateConstraintData(info, comp, idx)
+        finally:
+            # ``evaluate_index_predicates`` sets the row IndexTemplates to concrete
+            # index values; clear them so the all-False combination's template
+            # (which shares these templates) still reads as an unresolved
+            # template for the stock compiler / materialize-on-touch.
+            for t in row_templates:
+                t.set_value()
+        self._data = data
+        self._masked_template = payload
+        return True
 
     def _getitem_when_not_present(self, idx):
         if self._rule is None:

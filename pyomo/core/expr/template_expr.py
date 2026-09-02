@@ -7,6 +7,7 @@
 # software.  This software is distributed under the 3-clause BSD License.
 # ____________________________________________________________________________________
 
+import dis
 import itertools
 import logging
 import sys
@@ -36,7 +37,14 @@ from pyomo.core.expr.numvalue import (
     value,
     is_constant,
 )
-from pyomo.core.expr.relational_expr import tuple_to_relational_expr
+from pyomo.core.expr.relational_expr import (
+    tuple_to_relational_expr,
+    EqualityExpression,
+    NotEqualExpression,
+    InequalityExpression,
+    RangedExpression,
+    set_index_predicate_bool_hook,
+)
 from pyomo.core.expr.visitor import (
     ExpressionReplacementVisitor,
     StreamBasedExpressionVisitor,
@@ -72,6 +80,124 @@ def suppress_templatization_errors():
         yield
     finally:
         _SUPPRESS_TEMPLATIZATION_ERRORS = prev
+
+
+# --------------------------------------------------------------------------- #
+# Index-predicate capture (Phase 3b: filtered sums + index conditionals)
+# --------------------------------------------------------------------------- #
+#
+# By default a predicate on index values (``if j != n``, ``if t > 0``) raises
+# when it reaches a boolean context during templatization, because the index
+# values are not yet known -- so a rule containing a filtered sum or an index
+# conditional does not templatize and falls back to classic per-index
+# construction.  Under the opt-in vectorized-construction switch we instead
+# *capture* such predicates: a filter inside ``sum(... for j in J if PRED)`` is
+# recorded and attached to the ``TemplateSumExpression`` (so the extractor can
+# evaluate it as a NumPy mask over the sum grid), and an index conditional is
+# resolved by the ``conditional_policy`` (Phase-3b conditional replay).
+#
+# This is entirely gated on ``_INDEX_PREDICATE_CAPTURE`` being non-None, which
+# only happens for the duration of a vectorized templatization: with the switch
+# off, ``__bool__`` behaves exactly as in stock Pyomo.
+_INDEX_PREDICATE_CAPTURE = None
+
+
+class _IndexPredicateCapture:
+    """State for capturing index-value predicates during one templatization.
+
+    ``filters`` is a stack that :meth:`_template_iter_context.sum_template`
+    snapshots and drains around each ``next(generator)`` to collect the filter
+    predicate(s) of the sum it is building (``if j != n`` -> a conjunction of the
+    recorded comparisons).  A predicate encountered *outside* a sum filter is an
+    index conditional selector, handled by ``conditional_policy`` (a callable
+    ``(expr, capture) -> bool | None``; ``None`` declines, so the family falls
+    back).  ``unsupported`` latches when a conditional is seen with no policy.
+    """
+
+    __slots__ = ('filters', 'in_filter', 'conditional_policy', 'unsupported')
+
+    def __init__(self, conditional_policy=None):
+        self.filters = []
+        self.in_filter = 0
+        self.conditional_policy = conditional_policy
+        self.unsupported = False
+
+
+_COMPARISON_OPCODES = frozenset({'COMPARE_OP', 'CONTAINS_OP', 'IS_OP'})
+
+
+def _count_comparisons(code):
+    """Number of comparison opcodes in a (generator) code object."""
+    try:
+        return sum(
+            1 for i in dis.get_instructions(code) if i.opname in _COMPARISON_OPCODES
+        )
+    except TypeError:
+        return -1
+
+
+def _filter_is_pure_conjunction(generator, n_captured):
+    """True if the generator's filter is a pure conjunction of comparisons.
+
+    We capture a filter by making each comparison's ``__bool__`` return True, but
+    Python's ``or`` / ``not`` short-circuit, so a disjunction (``k < n or k > n``)
+    would silently capture only its first clause -- a wrong (too-permissive)
+    filter.  A conjunction (``a and b``, or chained ``if a if b``) instead
+    evaluates *every* comparison, so the count of comparison opcodes in the
+    generator equals the number of predicates we captured.  If they differ, the
+    filter short-circuited (an ``or`` / mixed boolean) and is not vectorizable as
+    a conjunction -- the caller falls back to classic construction.
+    """
+    code = getattr(generator, 'gi_code', None)
+    if code is None:
+        return False
+    ncomp = _count_comparisons(code)
+    return ncomp == n_captured
+
+
+def _index_predicate_hook(expr):
+    """``RelationalExpression.__bool__`` hook: capture an index predicate.
+
+    Returns the boolean the calling context should observe (after recording the
+    predicate), or ``None`` to decline -- in which case the normal "cannot
+    convert to bool" error is raised and the family falls back to classic
+    construction.  Declines for any predicate that touches a variable (only pure
+    index-value predicates are vectorizable).
+    """
+    cap = _INDEX_PREDICATE_CAPTURE
+    if cap is None:
+        return None
+    if expr.is_potentially_variable():
+        return None
+    if cap.in_filter:
+        # A generator filter inside a sum: record it and let the summand be
+        # yielded once (the extractor applies the mask over the sum grid).
+        cap.filters.append(expr)
+        return True
+    policy = cap.conditional_policy
+    if policy is None:
+        cap.unsupported = True
+        return None
+    return policy(expr, cap)
+
+
+@contextmanager
+def capture_index_predicates(conditional_policy=None):
+    """Enable index-predicate capture for the enclosed templatization.
+
+    Installs the :func:`_index_predicate_hook` on relational ``__bool__`` and a
+    fresh :class:`_IndexPredicateCapture`.  Restores the prior state on exit, so
+    it nests and never leaks into stock behaviour.
+    """
+    global _INDEX_PREDICATE_CAPTURE
+    prev = _INDEX_PREDICATE_CAPTURE
+    prev_hook = set_index_predicate_bool_hook(_index_predicate_hook)
+    _INDEX_PREDICATE_CAPTURE = _IndexPredicateCapture(conditional_policy)
+    try:
+        yield _INDEX_PREDICATE_CAPTURE
+    finally:
+        _INDEX_PREDICATE_CAPTURE = prev
+        set_index_predicate_bool_hook(prev_hook)
 
 
 def _validate_generator(generator):
@@ -522,13 +648,17 @@ class TemplateSumExpression(NumericExpression):
     Expression to represent an unexpanded sum over one or more sets.
     """
 
-    __slots__ = ('_iters', '_local_args_')
+    __slots__ = ('_iters', '_local_args_', '_filter')
     PRECEDENCE = 1
 
-    def __init__(self, args, _iters):
+    def __init__(self, args, _iters, _filter=None):
         assert len(args) == 1
         self._args_ = args
         self._iters = _iters
+        # Phase 3b: an optional filter for ``sum(... for j in J if PRED)`` -- a
+        # tuple of index-value predicate expressions, interpreted as a
+        # conjunction.  ``None`` means an unfiltered sum (stock behaviour).
+        self._filter = _filter
 
     def nargs(self):
         # Note: by definition, all _set pointers within an itergroup
@@ -559,8 +689,12 @@ class TemplateSumExpression(NumericExpression):
     def template_iters(self):
         return self._iters
 
+    def template_filter(self):
+        """The captured filter predicates (a conjunction), or ``None``."""
+        return self._filter
+
     def create_node_with_local_data(self, args):
-        return self.__class__(args, self._iters)
+        return self.__class__(args, self._iters, self._filter)
 
     def getname(self, *args, **kwds):
         return "SUM"
@@ -609,12 +743,19 @@ class TemplateSumExpression(NumericExpression):
             )
             for iterGroup in self._iters
         )
+        filtStr = ''
+        if self._filter:
+            preds = ' and '.join(
+                expression_to_string(p, verbose=verbose, smap=smap)
+                for p in self._filter
+            )
+            filtStr = ' if ' + preds
         if verbose:
             iterStr = ', '.join('iter(%s, %s)' % x for x in iterStrGenerator)
-            return 'templatesum(%s, %s)' % (val, iterStr)
+            return 'templatesum(%s, %s%s)' % (val, iterStr, filtStr)
         else:
             iterStr = ' '.join('for %s in %s' % x for x in iterStrGenerator)
-            return 'SUM(%s %s)' % (val, iterStr)
+            return 'SUM(%s %s%s)' % (val, iterStr, filtStr)
 
     def _resolve_template(self, args):
         with mutable_expression() as e:
@@ -708,6 +849,17 @@ class IndexTemplate(NumericValue):
         support variable indirection.
         """
         return False
+
+    def __ne__(self, other):
+        # Phase 3b: under the vectorized-construction switch, ``j != n`` in a
+        # generator filter must build a NotEqualExpression so the capture hook
+        # sees the ``!=`` predicate with the right polarity.  Python's default
+        # ``__ne__`` is ``not (self == other)``, which would evaluate
+        # ``bool(EqualityExpression)`` (an ``==`` node) and lose the negation.
+        # Outside capture, we reproduce that stock behaviour exactly.
+        if _INDEX_PREDICATE_CAPTURE is not None:
+            return NotEqualExpression((self, other))
+        return not (self == other)
 
     def __str__(self):
         return self.getname()
@@ -1160,8 +1312,37 @@ class _template_iter_context:
             # We will only templatize sums over maps and generators.
             # Expand everything else:
             return _TemplateIterManager.builtin_sum(generator)
+        # Phase 3b: capture any generator *filter* (``if j != n``) evaluated
+        # while advancing the generator, so it can be attached to the
+        # TemplateSumExpression.  ``in_filter`` marks the hook that this bool()
+        # is a filter (yield the summand, record the predicate) rather than an
+        # index conditional; the snapshot/drain isolates *this* sum's filter
+        # from any nested sum (whose filter is drained first).
+        cap = _INDEX_PREDICATE_CAPTURE
         niters = -len(self.cache)
-        expr = next(generator)
+        if cap is not None:
+            filt_mark = len(cap.filters)
+            cap.in_filter += 1
+            try:
+                expr = next(generator)
+            finally:
+                cap.in_filter -= 1
+            _filter = tuple(cap.filters[filt_mark:]) or None
+            del cap.filters[filt_mark:]
+            if _filter is not None and not _filter_is_pure_conjunction(
+                generator, len(_filter)
+            ):
+                # A disjunction / mixed-boolean filter short-circuited and we did
+                # not capture every comparison: reject so the family falls back
+                # to classic construction (rather than a wrong, too-loose mask).
+                raise TemplateExpressionError(
+                    None,
+                    "filtered sum with a non-conjunctive predicate "
+                    "(or / not / short-circuit) is not vectorizable",
+                )
+        else:
+            _filter = None
+            expr = next(generator)
         niters += len(self.cache)
         if niters:
             iters = self.npop_cache(niters)
@@ -1172,7 +1353,7 @@ class _template_iter_context:
             # See the validator implementations above for situations where
             # we will not attempt to generate SumTemplate objects
             return _TemplateIterManager.builtin_sum(generator, start=expr)
-        return TemplateSumExpression((expr,), iters)
+        return TemplateSumExpression((expr,), iters, _filter)
 
 
 class _template_iter_manager:
@@ -1307,8 +1488,153 @@ def templatize_rule(block, rule, index_set):
     return None, indices
 
 
-def templatize_constraint(con):
+def _templatize_constraint_raw(con):
+    """``templatize_rule`` for a constraint, with the tuple -> relational fix.
+
+    Assumes any desired predicate-capture context is already active.
+    """
     expr, indices = templatize_rule(con.parent_block(), con.rule, con.index_set())
     if expr.__class__ is tuple:
         expr = tuple_to_relational_expr(expr)
     return expr, indices
+
+
+def templatize_constraint(con, capture_predicates=False):
+    """Templatize a constraint family's rule.
+
+    ``capture_predicates`` (Phase 3b, opt-in) enables index-predicate capture so
+    a rule containing a filtered sum (``sum(... for j in J if j != n)``)
+    templatizes into a filter-carrying ``TemplateSumExpression`` instead of
+    failing.  Index conditionals still fall back (no ``conditional_policy``); use
+    :func:`masked_templatize_constraint` for conditional cover.
+    """
+    if capture_predicates:
+        with capture_index_predicates():
+            return _templatize_constraint_raw(con)
+    return _templatize_constraint_raw(con)
+
+
+# Result-tag constants for masked_templatize_constraint.
+MASKED_PLAIN = 'plain'
+MASKED_CONDITIONAL = 'masked'
+_MAX_CONDITIONAL_PREDICATES = 6
+
+
+def masked_templatize_constraint(con):
+    """Templatize a rule that contains index conditionals, via polarity replay.
+
+    An index conditional -- ``(m.s[n, t - 1] if t > 0 else 0)`` or a guarded
+    ``if t == 0: return Constraint.Skip`` -- selects a *branch* by a predicate on
+    the row index.  Python evaluates only the taken branch, so a single
+    templatization cannot see both.  We therefore *replay* the rule once per
+    truth-assignment (polarity combination) of the conditional predicates it
+    contains, each replay forcing those predicates to fixed booleans and yielding
+    an ordinary (branch-free) template; at extraction each row uses the template
+    of the combination its index actually satisfies (and is dropped if that
+    combination returns ``Constraint.Skip``).  Filtered sums inside a branch are
+    captured as usual, so conditionals and filters compose.
+
+    Returns one of:
+
+    * ``(MASKED_PLAIN, (expr, indices))`` -- no index conditionals were found
+      (the rule templatized with filters only); the caller stores it as a plain
+      template.
+    * ``(MASKED_CONDITIONAL, (row_templates, predicates, combos))`` -- where
+      ``predicates`` is the ordered list of conditional predicates (over
+      ``row_templates``) and ``combos`` maps each truth-assignment tuple to a
+      plain ``(expr, indices)`` template or to ``Constraint.Skip``.
+
+    Raises (caller falls back to classic) if the conditional structure is not a
+    flat, index-only set of predicates -- e.g. a predicate that is not a pure
+    index comparison, more than :data:`_MAX_CONDITIONAL_PREDICATES` predicates,
+    or a structure whose predicate set changes with the branch taken (nested /
+    data-dependent conditionals).
+    """
+    from pyomo.core.base.indexed_component import IndexedComponent
+
+    Skip = IndexedComponent.Skip
+
+    # --- Pass 1: discovery (force every conditional False) ---------------- #
+    discovered = []
+
+    def discover(expr, cap):
+        discovered.append(expr)
+        return False
+
+    with capture_index_predicates(conditional_policy=discover) as cap:
+        info0 = _templatize_constraint_raw(con)
+        if cap.unsupported:
+            raise TemplateExpressionError(
+                None, "index conditional predicate is not vectorizable"
+            )
+    k = len(discovered)
+    if k == 0:
+        return MASKED_PLAIN, info0
+    if k > _MAX_CONDITIONAL_PREDICATES:
+        raise TemplateExpressionError(
+            None, "too many index conditionals to vectorize (%d)" % (k,)
+        )
+    pred_signature = [p.to_string() for p in discovered]
+    row_templates = info0[1]
+
+    # --- Replay each polarity combination -------------------------------- #
+    combos = {(False,) * k: info0}
+    for bits in itertools.product((False, True), repeat=k):
+        if bits in combos:
+            continue
+        replay = {'preds': [], 'i': 0}
+
+        def force(expr, cap, _bits=bits, _r=replay):
+            _r['preds'].append(expr)
+            j = _r['i']
+            _r['i'] += 1
+            return _bits[j] if j < len(_bits) else False
+
+        with capture_index_predicates(conditional_policy=force) as cap:
+            infob = _templatize_constraint_raw(con)
+            if (
+                cap.unsupported
+                or replay['i'] != k
+                or [p.to_string() for p in replay['preds']] != pred_signature
+            ):
+                raise TemplateExpressionError(
+                    None, "inconsistent index-conditional structure"
+                )
+        combos[bits] = infob
+    return MASKED_CONDITIONAL, (row_templates, discovered, combos)
+
+
+def _scalar_predicate_value(pred):
+    """Evaluate one index predicate (templates already set) to a Python bool.
+
+    Note we evaluate *by value* rather than ``bool(pred)``: a NotEqualExpression's
+    ``__bool__`` short-circuits on object identity, which is not the index-value
+    comparison we need here.
+    """
+    if pred.__class__ is EqualityExpression:
+        return value(pred.args[0]) == value(pred.args[1])
+    if pred.__class__ is NotEqualExpression:
+        return value(pred.args[0]) != value(pred.args[1])
+    if pred.__class__ is InequalityExpression:
+        a, b = value(pred.args[0]), value(pred.args[1])
+        return a < b if pred.strict else a <= b
+    if pred.__class__ is RangedExpression:
+        lb, x, ub = (value(a) for a in pred.args)
+        s = pred.strict
+        return (lb < x if s[0] else lb <= x) and (x < ub if s[1] else x <= ub)
+    raise TemplateExpressionError(None, "unsupported index predicate")
+
+
+def evaluate_index_predicates(predicates, row_templates, index):
+    """Return the truth-assignment tuple of ``predicates`` at one row ``index``.
+
+    Sets the row IndexTemplates to the concrete index values and evaluates each
+    predicate.  This is a cheap O(1)-per-predicate scalar evaluation (no
+    expression-tree build, no template resolution of the body) used at construct
+    time to route each row to its polarity combination.
+    """
+    if index.__class__ is not tuple:
+        index = (index,)
+    for t, v in zip(row_templates, index):
+        t.set_value(v)
+    return tuple(_scalar_predicate_value(p) for p in predicates)

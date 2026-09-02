@@ -1,0 +1,244 @@
+{
+  "sysinfo": {
+    "python": "3.12.13",
+    "platform": "Linux-6.17.7-ba29.fc43.x86_64-x86_64-with-glibc2.42",
+    "machine": "x86_64",
+    "processor": "x86_64",
+    "cpu_count": 12,
+    "pyomo_repo": "/var/home/marlon/.treehouse/pyomo-808831/1/pyomo",
+    "pyomo_commit": "0700bd6f62bced93a392ceaf2bab07891331490c",
+    "packages": {
+      "Pyomo": "6.10.2.dev0",
+      "numpy": "2.5.2",
+      "scipy": "1.18.1",
+      "highspy": "1.15.1",
+      "gurobipy": null,
+      "linopy": null,
+      "xarray": null,
+      "pandas": null
+    },
+    "pyomo_file": "/var/home/marlon/.treehouse/pyomo-808831/1/pyomo/pyomo/__init__.py"
+  },
+  "suite": "full",
+  "config": {
+    "backends": [
+      "pyomo_template"
+    ],
+    "models": [
+      "flow_masked",
+      "network_flow"
+    ],
+    "sizes": [
+      "1e6"
+    ],
+    "repeats": 5,
+    "warmup": 1
+  },
+  "results": [
+    {
+      "backend": "pyomo_template",
+      "model": "flow_masked",
+      "size": "1e6",
+      "params": {
+        "N": 50,
+        "T": 200
+      },
+      "repeats": 3,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct_off": {
+          "name": "construct_off",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1599.750983004924,
+          "median_ms": 1620.788533007726,
+          "mean_ms": 1625.592628668528,
+          "stdev_ms": 23.309736499610484,
+          "samples_ms": [
+            1620.7885,
+            1599.751,
+            1656.2384
+          ]
+        },
+        "construct_on": {
+          "name": "construct_on",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 942.129697999917,
+          "median_ms": 955.3282659908291,
+          "mean_ms": 963.4012616588734,
+          "stdev_ms": 21.43794021238332,
+          "samples_ms": [
+            942.1297,
+            955.3283,
+            992.7458
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 5549.401647003833,
+          "median_ms": 5753.090635989793,
+          "mean_ms": 5764.410045657617,
+          "stdev_ms": 180.35244878344506,
+          "samples_ms": [
+            5990.7379,
+            5549.4016,
+            5753.0906
+          ]
+        },
+        "fastload_off": {
+          "name": "fastload_off",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 2423.0201430036686,
+          "median_ms": 2436.3223299733363,
+          "mean_ms": 2437.109059324333,
+          "stdev_ms": 11.837811457517459,
+          "samples_ms": [
+            2436.3223,
+            2423.0201,
+            2451.9847
+          ]
+        },
+        "fastload_on": {
+          "name": "fastload_on",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1696.0784929979127,
+          "median_ms": 1717.9853729903698,
+          "mean_ms": 1716.1672143265605,
+          "stdev_ms": 15.712796119051555,
+          "samples_ms": [
+            1734.4378,
+            1696.0785,
+            1717.9854
+          ]
+        }
+      },
+      "has_templates": true,
+      "templatized_rows": 10000,
+      "classic_rows": 0,
+      "stats": {
+        "n_vars": 500000,
+        "n_binary": 0,
+        "n_integer": 0,
+        "n_constraints": 10000,
+        "nnz": 999950
+      },
+      "construct_speedup": 1.697,
+      "classic_coherent_ms": 7373.879,
+      "phase2_build_to_solver_ms": 4057.111,
+      "phase3_build_to_solver_ms": 2673.314,
+      "end_to_end_vs_classic": 2.758,
+      "end_to_end_vs_phase2": 1.518,
+      "peak_rss_mb": 912.72
+    },
+    {
+      "backend": "pyomo_template",
+      "model": "network_flow",
+      "size": "1e6",
+      "params": {
+        "N": 50,
+        "T": 200
+      },
+      "repeats": 3,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct_off": {
+          "name": "construct_off",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1666.873329988448,
+          "median_ms": 1690.751968009863,
+          "mean_ms": 1710.9884753396425,
+          "stdev_ms": 46.535998542482915,
+          "samples_ms": [
+            1690.752,
+            1775.3401,
+            1666.8733
+          ]
+        },
+        "construct_on": {
+          "name": "construct_on",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1660.568755993154,
+          "median_ms": 1675.5889220221434,
+          "mean_ms": 1679.2605120087198,
+          "stdev_ms": 16.960557777645,
+          "samples_ms": [
+            1701.6239,
+            1660.5688,
+            1675.5889
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 6113.163859001361,
+          "median_ms": 6123.12011999893,
+          "mean_ms": 6186.809620334922,
+          "stdev_ms": 97.19572129350281,
+          "samples_ms": [
+            6123.1201,
+            6113.1639,
+            6324.1449
+          ]
+        },
+        "fastload_off": {
+          "name": "fastload_off",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 2356.41442501219,
+          "median_ms": 2483.022427011747,
+          "mean_ms": 2529.6644030119446,
+          "stdev_ms": 163.85308484130522,
+          "samples_ms": [
+            2749.5564,
+            2483.0224,
+            2356.4144
+          ]
+        },
+        "fastload_on": {
+          "name": "fastload_on",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 3315.9594369935803,
+          "median_ms": 3390.615208016243,
+          "mean_ms": 3370.4560730063045,
+          "stdev_ms": 38.96724280798172,
+          "samples_ms": [
+            3390.6152,
+            3404.7936,
+            3315.9594
+          ]
+        }
+      },
+      "has_templates": false,
+      "templatized_rows": 0,
+      "classic_rows": 10000,
+      "stats": {
+        "n_vars": 500000,
+        "n_binary": 0,
+        "n_integer": 0,
+        "n_constraints": 10000,
+        "nnz": 999950
+      },
+      "construct_speedup": 1.009,
+      "classic_coherent_ms": 7813.872,
+      "phase2_build_to_solver_ms": 4173.774,
+      "phase3_build_to_solver_ms": 5066.204,
+      "end_to_end_vs_classic": 1.542,
+      "end_to_end_vs_phase2": 0.824,
+      "peak_rss_mb": 915.61
+    }
+  ],
+  "complete": true
+}

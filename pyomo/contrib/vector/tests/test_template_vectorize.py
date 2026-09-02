@@ -84,22 +84,147 @@ def _mixed_model():
     return m
 
 
-def _nontemplatizable_model():
-    """Filtered sum + index conditional: nothing templatizes (full fallback)."""
+def _filtered_conditional_model():
+    """Filtered sum + index conditional (Phase 3b): templatizes end-to-end.
+
+    A network-flow-shaped balance rule -- the boundary case Phase 3 documented as
+    a fallback -- now vectorizes: the filtered sums (``for j in N if j != n``,
+    over the sparse arc pattern) and the storage-boundary conditional
+    (``m.s[n, t - 1] if t > 0 else 0``) are both covered.
+    """
     m = pyo.ConcreteModel()
     m.N = pyo.RangeSet(0, 3)
     m.T = pyo.RangeSet(0, 2)
-    m.f = pyo.Var(m.N, m.N, m.T, domain=pyo.NonNegativeReals, bounds=(0, 5))
+    m.arcs = pyo.Set(
+        initialize=[(i, j) for i in range(4) for j in range(4) if i != j], dimen=2
+    )
+    m.f = pyo.Var(m.arcs, m.T, domain=pyo.NonNegativeReals, bounds=(0, 5))
     m.s = pyo.Var(m.N, m.T, domain=pyo.NonNegativeReals, bounds=(0, 5))
+    # Zero net demand keeps the balance feasible (all-zero flow); the mutable
+    # Param RHS still exercises composition with the Phase-3 RHS path.
+    m.d = pyo.Param(
+        m.N, m.T, initialize={(n, t): 0.0 for n in range(4) for t in range(3)},
+        mutable=True,
+    )
 
     def bal(m, n, t):
         inflow = sum(m.f[j, n, t] for j in m.N if j != n)
         outflow = sum(m.f[n, j, t] for j in m.N if j != n)
         prev = m.s[n, t - 1] if t > 0 else 0.0
-        return inflow - outflow + prev - m.s[n, t] == 0.0
+        return inflow - outflow + prev - m.s[n, t] == m.d[n, t]
 
     m.bal = pyo.Constraint(m.N, m.T, rule=bal)
-    m.obj = pyo.Objective(expr=sum(m.f[i, j, t] for i in m.N for j in m.N for t in m.T))
+    m.obj = pyo.Objective(
+        expr=sum(m.f[i, j, t] for (i, j) in m.arcs for t in m.T)
+        + sum(m.s[n, t] for n in m.N for t in m.T)
+    )
+    return m
+
+
+def _filtered_sum_model():
+    """Filtered sums only (Phase 3b): ``!=``, ``<``, and a conjunction."""
+    m = pyo.ConcreteModel()
+    m.I = pyo.RangeSet(0, 5)
+    m.x = pyo.Var(m.I, m.I, domain=pyo.NonNegativeReals, bounds=(0, 10))
+    m.y = pyo.Var(m.I, domain=pyo.NonNegativeReals, bounds=(0, 10))
+    m.b = pyo.Param(m.I, initialize={i: 1.0 + i for i in range(6)}, mutable=True)
+    # off-diagonal row sum (the sparse-arc pattern)
+    m.row = pyo.Constraint(
+        m.I, rule=lambda m, i: sum(m.x[i, j] for j in m.I if j != i) <= m.b[i]
+    )
+    # lower-triangular column sum, with a base term so no row is trivial
+    m.col = pyo.Constraint(
+        m.I, rule=lambda m, i: m.y[i] + sum(m.x[j, i] for j in m.I if j < i) >= 0.5
+    )
+    # conjunction filter
+    m.up = pyo.Constraint(
+        m.I,
+        rule=lambda m, i: m.y[i] + sum(m.x[i, j] for j in m.I if j > i if j != i)
+        <= 3.0,
+    )
+    m.obj = pyo.Objective(
+        expr=sum(m.x[i, j] for i in m.I for j in m.I) + sum(m.y[i] for i in m.I)
+    )
+    return m
+
+
+def _conditional_model():
+    """Index conditionals in the body (Phase 3b): ``(term if pred else const)``."""
+    m = pyo.ConcreteModel()
+    m.N = pyo.RangeSet(0, 3)
+    m.T = pyo.RangeSet(0, 4)
+    m.s = pyo.Var(m.N, m.T, domain=pyo.NonNegativeReals, bounds=(0, 5))
+    m.x = pyo.Var(m.N, m.T, domain=pyo.NonNegativeReals, bounds=(0, 5))
+    m.d = pyo.Param(
+        m.N, m.T, initialize={(n, t): 0.5 for n in range(4) for t in range(5)},
+        mutable=True,
+    )
+    # storage-boundary conditional (True branch is a var term, else a constant)
+    m.ramp = pyo.Constraint(
+        m.N,
+        m.T,
+        rule=lambda m, n, t: m.x[n, t] + (m.s[n, t - 1] if t > 0 else 0.0) - m.s[n, t]
+        == m.d[n, t],
+    )
+    # two independent conditionals (k=2 polarity combinations)
+    m.two = pyo.Constraint(
+        m.N,
+        m.T,
+        rule=lambda m, n, t: (m.s[n, t] if n == 0 else 0.0)
+        + (m.x[n, t - 1] if t > 0 else 0.0)
+        - m.x[n, t]
+        <= 1.0,
+    )
+    m.obj = pyo.Objective(
+        expr=sum(m.s[n, t] + m.x[n, t] for n in m.N for t in m.T)
+    )
+    return m
+
+
+def _skip_model():
+    """Constraint.Skip under an index predicate (Phase 3b): rows dropped."""
+    m = pyo.ConcreteModel()
+    m.N = pyo.RangeSet(0, 3)
+    m.T = pyo.RangeSet(0, 4)
+    m.s = pyo.Var(m.N, m.T, domain=pyo.NonNegativeReals, bounds=(0, 5))
+    m.ramp = pyo.Constraint(
+        m.N,
+        m.T,
+        rule=lambda m, n, t: (
+            pyo.Constraint.Skip if t == 0 else m.s[n, t] - m.s[n, t - 1] <= 1.0
+        ),
+    )
+    m.obj = pyo.Objective(expr=sum(m.s[n, t] for n in m.N for t in m.T))
+    return m
+
+
+def _genuinely_nontemplatizable_model():
+    """Outside the proven subset -> full classic fallback (byte-identical).
+
+    A modulo (non-affine) index and a Python-``dict`` RHS look-up on the index --
+    neither is expressible on the vectorized path, so every family falls back.
+    """
+    import math
+
+    m = pyo.ConcreteModel()
+    m.N = pyo.RangeSet(0, 3)
+    m.T = pyo.RangeSet(0, 3)
+    n = 4
+    m.s = pyo.Var(m.N, m.T, domain=pyo.NonNegativeReals, bounds=(0, 5))
+    rhs = {(i, t): 0.1 * (i + t) for i in range(4) for t in range(4)}
+    # modulo (wrap-around) index: non-affine
+    m.wrap = pyo.Constraint(
+        m.N, m.T, rule=lambda m, i, t: m.s[i, t] - m.s[(i + 1) % n, t] <= 1.0
+    )
+    # transcendental Python RHS of the index (like network_flow's demand)
+    m.tr = pyo.Constraint(
+        m.N,
+        m.T,
+        rule=lambda m, i, t: m.s[i, t] >= 0.1 + 0.05 * math.sin(0.3 * t + i),
+    )
+    # Python dict RHS look-up on the index
+    m.lk = pyo.Constraint(m.N, m.T, rule=lambda m, i, t: m.s[i, t] <= 1.0 + rhs[i, t])
+    m.obj = pyo.Objective(expr=sum(m.s[n, t] for n in m.N for t in m.T))
     return m
 
 
@@ -128,6 +253,45 @@ def _random_model(seed):
     m.obj = pyo.Objective(
         expr=sum(coefs[j] * m.x[j] for j in range(n)), sense=pyo.maximize
     )
+    return m
+
+
+def _vars_both_filter_model():
+    """Vars on **both sides** of a relation, one side's filter empty for boundary
+    rows (review F1).  Row i=0 has an empty ``j < i`` filter, so classic collapses
+    that side to the constant 0 and re-orients onto the surviving (positive) side;
+    the vectorized path must reproduce that per-row orientation (same *signed*
+    nonzeros), not just the feasible set."""
+    m = pyo.ConcreteModel()
+    m.I = pyo.RangeSet(0, 5)
+    m.x = pyo.Var(m.I, m.I, domain=pyo.NonNegativeReals, bounds=(0, 5))
+    m.eq = pyo.Constraint(
+        m.I,
+        rule=lambda m, i: sum(m.x[i, j] for j in m.I if j < i)
+        == sum(m.x[i, j] for j in m.I if j > i),
+    )
+    m.le = pyo.Constraint(
+        m.I,
+        rule=lambda m, i: sum(m.x[i, j] for j in m.I if j < i)
+        <= sum(m.x[i, j] for j in m.I if j > i),
+    )
+    m.obj = pyo.Objective(expr=sum(m.x[i, j] for i in m.I for j in m.I))
+    return m
+
+
+def _conditional_diff_vars_model():
+    """Conditional whose True / False branches reference **different, in-range**
+    variables (review F2).  A flipped routing bit then produces a valid-but-wrong
+    matrix -- unlike a same-variable / out-of-range branch, which self-heals via
+    the classic fallback and hides the routing error."""
+    m = pyo.ConcreteModel()
+    m.N = pyo.RangeSet(0, 3)
+    m.a = pyo.Var(m.N, domain=pyo.NonNegativeReals, bounds=(0, 5))
+    m.b = pyo.Var(m.N, domain=pyo.NonNegativeReals, bounds=(0, 5))
+    m.c = pyo.Constraint(
+        m.N, rule=lambda m, n: (3.0 * m.a[n] if n < 2 else 7.0 * m.b[n]) <= 4.0
+    )
+    m.obj = pyo.Objective(expr=sum(m.a[n] + m.b[n] for n in m.N))
     return m
 
 
@@ -207,7 +371,11 @@ class TestTemplateEquivalence(unittest.TestCase):
     BUILDERS = {
         'templatizable': _templatizable_model,
         'mixed': _mixed_model,
-        'nontemplatizable': _nontemplatizable_model,
+        'filtered_conditional': _filtered_conditional_model,
+        'filtered_sum': _filtered_sum_model,
+        'conditional': _conditional_model,
+        'skip': _skip_model,
+        'genuinely_nontemplatizable': _genuinely_nontemplatizable_model,
     }
 
     def test_construct_equivalence_stock(self):
@@ -271,7 +439,15 @@ class TestTemplateSolveEquivalence(unittest.TestCase):
         highspy = _try_highspy()
         if highspy is None:
             self.skipTest("highspy not available")
-        for builder in (_templatizable_model, _mixed_model, _nontemplatizable_model):
+        for builder in (
+            _templatizable_model,
+            _mixed_model,
+            _filtered_conditional_model,
+            _filtered_sum_model,
+            _conditional_model,
+            _skip_model,
+            _genuinely_nontemplatizable_model,
+        ):
             m_on = _build(builder, True)
             res = self._fastload_solve(m_on)
             m_off = _build(builder, False)
@@ -349,11 +525,12 @@ class TestFallbackAndOffState(unittest.TestCase):
 
     def test_nontemplatizable_fallback_byte_identical(self):
         # The fallback build must be structurally identical to classic.
-        m_on = _build(_nontemplatizable_model, True)
-        m_off = _build(_nontemplatizable_model, False)
+        m_on = _build(_genuinely_nontemplatizable_model, True)
+        m_off = _build(_genuinely_nontemplatizable_model, False)
         # every constraint fell back to a classic ConstraintData
-        for cd in m_on.bal.values():
-            self.assertIs(type(cd), ConstraintData)
+        for fam in ('wrap', 'tr', 'lk'):
+            for cd in getattr(m_on, fam).values():
+                self.assertIs(type(cd), ConstraintData)
         # same standard form
         self.assertEqual(
             canonical_standard_form(_stock_sf(m_on)),
@@ -364,9 +541,169 @@ class TestFallbackAndOffState(unittest.TestCase):
         # Constructing a non-templatizable model with the switch on must not emit
         # an ERROR (the fallback is silent; at most a debug note).
         with LoggingIntercept(level=logging.INFO) as out:
-            _build(_nontemplatizable_model, True)
+            _build(_genuinely_nontemplatizable_model, True)
         self.assertNotIn("ERROR", out.getvalue())
         self.assertNotIn("was raised when templatizing", out.getvalue())
+
+
+@unittest.skipUnless(numpy_available and scipy_available, "requires numpy/scipy")
+class TestPhase3bCoverage(unittest.TestCase):
+    """Filtered sums, index conditionals, and Skip vectorize; deferrals fall back."""
+
+    def _templatized(self, con):
+        return isinstance(next(iter(con.values())), TemplateConstraintData)
+
+    def test_filtered_sum_templatizes(self):
+        m = _build(_filtered_sum_model, True)
+        for fam in ('row', 'col', 'up'):
+            self.assertTrue(
+                self._templatized(getattr(m, fam)), f"{fam} did not templatize"
+            )
+
+    def test_conditional_templatizes(self):
+        m = _build(_conditional_model, True)
+        self.assertTrue(self._templatized(m.ramp))
+        self.assertTrue(self._templatized(m.two))
+
+    def test_skip_templatizes_and_drops_rows(self):
+        m_on = _build(_skip_model, True)
+        m_off = _build(_skip_model, False)
+        self.assertTrue(self._templatized(m_on.ramp))
+        # the t == 0 rows are skipped in both builds (same count)
+        self.assertEqual(len(m_on.ramp), len(m_off.ramp))
+        self.assertEqual(len(m_on.ramp), 4 * 4)  # 4 nodes x (5 - 1) periods
+
+    def test_new_shapes_compile_equivalence(self):
+        from pyomo.contrib.vector import compile_templated_to_highs_arrays
+
+        for builder in (
+            _filtered_sum_model,
+            _conditional_model,
+            _skip_model,
+            _filtered_conditional_model,
+        ):
+            m_on = _build(builder, True)
+            m_off = _build(builder, False)
+            self.assertEqual(
+                _range_rows_from_compiled(compile_templated_to_highs_arrays(m_on)),
+                _range_rows_from_stock(_stock_sf(m_off)),
+                f"compile equivalence failed for {builder.__name__}",
+            )
+
+    def test_vars_both_sides_filter_signed_nonzero(self):
+        # Review F1: a vars-both-sides relation whose one side's filtered sum is
+        # empty for a boundary row must be *byte-identical* (same signed nonzeros
+        # and bounds) to the classic standard form -- not merely feasible-set
+        # equivalent.  _range_rows_* carry signed coefficients, so equality here
+        # pins the sign.
+        from pyomo.contrib.vector import compile_templated_to_highs_arrays
+
+        m_on = _build(_vars_both_filter_model, True)
+        m_off = _build(_vars_both_filter_model, False)
+        # not a vacuous pass: the families actually vectorized
+        self.assertTrue(self._templatized(m_on.eq))
+        self.assertTrue(self._templatized(m_on.le))
+        # signed-nonzero equality (the old whole-row sign flip on the empty-filter
+        # boundary rows fails exactly this assertion).
+        self.assertEqual(
+            _range_rows_from_compiled(compile_templated_to_highs_arrays(m_on)),
+            _range_rows_from_stock(_stock_sf(m_off)),
+        )
+        # sanity on the classic side: the i=0 boundary row (lhs filter empty)
+        # re-orients onto the surviving positive side.
+        from pyomo.repn.standard_repn import generate_standard_repn
+
+        repn = generate_standard_repn(m_off.eq[0].body)
+        self.assertTrue(repn.linear_coefs and all(c > 0 for c in repn.linear_coefs))
+
+    def test_conditional_routing_diff_vars(self):
+        # Review F2: a conditional whose branches reference different in-range
+        # variables catches a flipped routing bit (a same-var / out-of-range
+        # model self-heals via fallback and hides the error).
+        from pyomo.contrib.vector import compile_templated_to_highs_arrays
+
+        m_on = _build(_conditional_diff_vars_model, True)
+        m_off = _build(_conditional_diff_vars_model, False)
+        self.assertTrue(self._templatized(m_on.c))
+        self.assertEqual(
+            _range_rows_from_compiled(compile_templated_to_highs_arrays(m_on)),
+            _range_rows_from_stock(_stock_sf(m_off)),
+        )
+
+    def test_deferrals_fall_back_byte_identical(self):
+        # Predicates outside the proven subset must fall back to classic,
+        # byte-identically (never a wrong -- e.g. too-loose -- mask).
+        import math
+
+        def _or_filter(m):
+            m.I = pyo.RangeSet(0, 4)
+            m.x = pyo.Var(m.I, m.I, bounds=(0, 5))
+            m.c = pyo.Constraint(
+                m.I,
+                rule=lambda m, i: sum(m.x[i, j] for j in m.I if j < i or j > i) <= 3.0,
+            )
+            m.obj = pyo.Objective(expr=sum(m.x[i, j] for i in m.I for j in m.I))
+
+        def _not_filter(m):
+            m.I = pyo.RangeSet(0, 4)
+            m.x = pyo.Var(m.I, m.I, bounds=(0, 5))
+            m.c = pyo.Constraint(
+                m.I,
+                rule=lambda m, i: sum(m.x[i, j] for j in m.I if not (j == i)) <= 3.0,
+            )
+            m.obj = pyo.Objective(expr=sum(m.x[i, j] for i in m.I for j in m.I))
+
+        def _nested_conditional(m):
+            m.N = pyo.RangeSet(0, 3)
+            m.T = pyo.RangeSet(0, 3)
+            m.x = pyo.Var(m.N, m.T, bounds=(0, 5))
+            m.c = pyo.Constraint(
+                m.N,
+                m.T,
+                rule=lambda m, n, t: m.x[n, t]
+                + (m.x[n, t] if n == 0 else (m.x[n, t - 1] if t > 0 else 0.0))
+                <= 3.0,
+            )
+            m.obj = pyo.Objective(expr=sum(m.x[n, t] for n in m.N for t in m.T))
+
+        for setup in (_or_filter, _not_filter, _nested_conditional):
+
+            def build():
+                m = pyo.ConcreteModel()
+                setup(m)
+                return m
+
+            m_on = _build(build, True)
+            m_off = _build(build, False)
+            # fell back: classic ConstraintData
+            for cd in m_on.c.values():
+                self.assertIs(
+                    type(cd), ConstraintData, f"{setup.__name__} unexpectedly templatized"
+                )
+            # and byte-identical to classic
+            self.assertEqual(
+                canonical_standard_form(_stock_sf(m_on)),
+                canonical_standard_form(_stock_sf(m_off)),
+                f"{setup.__name__} fallback not byte-identical",
+            )
+
+    def test_network_flow_falls_back_transcendental_rhs(self):
+        # The documented boundary exemplar: network_flow's filtered sums and
+        # conditional are now covered, but its RHS is a transcendental Python
+        # function of the index (math.sin) -- out of scope -- so the family still
+        # falls back, byte-identically.
+        try:
+            from bench.models import network_flow as nf
+        except Exception:
+            self.skipTest("bench network_flow model not importable")
+        m_on = _build(lambda: nf.build_pyomo(nf.SIZES['xs']), True)
+        m_off = _build(lambda: nf.build_pyomo(nf.SIZES['xs']), False)
+        for cd in m_on.balance.values():
+            self.assertIs(type(cd), ConstraintData)
+        self.assertEqual(
+            canonical_standard_form(_stock_sf(m_on)),
+            canonical_standard_form(_stock_sf(m_off)),
+        )
 
 
 def _try_highspy():

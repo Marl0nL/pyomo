@@ -123,22 +123,28 @@ Equivalently, set the environment variable process-wide with no code change at a
 PYOMO_VECTOR_CONSTRUCT=1 python your_model.py
 ```
 
-**The templatizable subset** (exactly what Phase-0 Spike B proved): linear bodies
-that are a combination of `coef * var[affine_index…]` terms with **constant**
-coefficients, optionally inside an **unfiltered** `sum(… for j in Set)`; multiple
-variable components (`x[f,c] <= open[f]`); constant or mutable-`Param` RHS;
-equality / inequality / ranged relations.
+**The templatizable subset:** linear bodies that are a combination of
+`coef * var[affine_index…]` terms with **constant** coefficients, optionally
+inside a `sum(… for j in Set)`; multiple variable components (`x[f,c] <=
+open[f]`); constant or mutable-`Param` RHS; equality / inequality / ranged
+relations. Phase 3b extends this to **filtered sums** whose filter is a comparison
+or conjunction of comparisons on index values (`sum(m.f[j,n] for j in N if j !=
+n)`, `if j < i`, `if t > 0`, chained `if a if b`), **index conditionals** in the
+body (`m.s[n, t-1] if t > 0 else 0`), and **`Constraint.Skip` under an index
+predicate** — see `bench/PHASE3B_REPORT.md`.
 
-**Out of subset → classic fallback** (logged once at debug level): index
-conditionals (`if i == 0`), **filtered sums** (`for j in J if j != n`), modulo /
-non-affine indexing (`x[(i-1) % N]`), and index-dependent coefficients
-(`a[i,j]*x[j]`). These are common in real models, so the fallback is the norm, not
-an edge case — a mixed model vectorizes the families that qualify and compiles the
-rest classically, all byte-identical to the classic standard form.
+**Out of subset → classic fallback** (logged once at debug level): disjunctive /
+negated filters (`if j < n or j > n`, `if not …`) and set-membership filters,
+modulo / non-affine indexing (`x[(i-1) % N]`), index-dependent coefficients
+(`a[i,j]*x[j]`), nested / data-dependent conditionals, and transcendental /
+arbitrary-Python functions of the index (`sin(0.3*t + n)` as an RHS). A mixed
+model vectorizes the families that qualify and compiles the rest classically, all
+byte-identical to the classic standard form.
 
-**When it wins:** up to **11.2× construct / 9.8× end-to-end** on a templatizable-heavy
-model at 1e6 nonzeros; **no material slowdown** (within noise) on a model whose
-rules don't templatize (`bench/PHASE3_REPORT.md`).
+**When it wins:** up to **32× construct / 11× end-to-end** on a templatizable-heavy
+model at 1e6 nonzeros (filtered-sum coupling); **no material slowdown** (within
+noise) on a model whose rules don't templatize
+(`bench/PHASE3_REPORT.md`, `bench/PHASE3B_REPORT.md`).
 
 *Known limitation:* a model built with the switch on cannot currently be `clone()`d
 (a pre-existing core limitation of experimental template expressions).
