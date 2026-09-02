@@ -1,0 +1,244 @@
+{
+  "sysinfo": {
+    "python": "3.12.13",
+    "platform": "Linux-6.17.7-ba29.fc43.x86_64-x86_64-with-glibc2.42",
+    "machine": "x86_64",
+    "processor": "x86_64",
+    "cpu_count": 12,
+    "pyomo_repo": "/var/home/marlon/.treehouse/pyomo-808831/1/pyomo",
+    "pyomo_commit": "0700bd6f62bced93a392ceaf2bab07891331490c",
+    "packages": {
+      "Pyomo": "6.10.2.dev0",
+      "numpy": "2.5.2",
+      "scipy": "1.18.1",
+      "highspy": "1.15.1",
+      "gurobipy": null,
+      "linopy": null,
+      "xarray": null,
+      "pandas": null
+    },
+    "pyomo_file": "/var/home/marlon/.treehouse/pyomo-808831/1/pyomo/pyomo/__init__.py"
+  },
+  "suite": "full",
+  "config": {
+    "backends": [
+      "pyomo_template"
+    ],
+    "models": [
+      "coupling_filtered",
+      "resource_coupling"
+    ],
+    "sizes": [
+      "1e6"
+    ],
+    "repeats": 5,
+    "warmup": 1
+  },
+  "results": [
+    {
+      "backend": "pyomo_template",
+      "model": "coupling_filtered",
+      "size": "1e6",
+      "params": {
+        "Z": 100,
+        "J": 100
+      },
+      "repeats": 3,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct_off": {
+          "name": "construct_off",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 664.8451480141375,
+          "median_ms": 665.1898169948254,
+          "mean_ms": 665.1648909998281,
+          "stdev_ms": 0.2515113914759333,
+          "samples_ms": [
+            664.8451,
+            665.1898,
+            665.4597
+          ]
+        },
+        "construct_on": {
+          "name": "construct_on",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 18.770272989058867,
+          "median_ms": 20.62500099418685,
+          "mean_ms": 20.091741656263668,
+          "stdev_ms": 0.9401983667738935,
+          "samples_ms": [
+            20.625,
+            20.88,
+            18.7703
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1309.1494849941228,
+          "median_ms": 1317.195287992945,
+          "mean_ms": 1326.282559001508,
+          "stdev_ms": 18.829296429420413,
+          "samples_ms": [
+            1352.5029,
+            1317.1953,
+            1309.1495
+          ]
+        },
+        "fastload_off": {
+          "name": "fastload_off",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 526.0045469913166,
+          "median_ms": 528.5741649859119,
+          "mean_ms": 528.9964909898117,
+          "stdev_ms": 2.632320129527985,
+          "samples_ms": [
+            528.5742,
+            532.4108,
+            526.0045
+          ]
+        },
+        "fastload_on": {
+          "name": "fastload_on",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 157.53438300453126,
+          "median_ms": 157.9306419880595,
+          "mean_ms": 158.1818986645279,
+          "stdev_ms": 0.6557942157429011,
+          "samples_ms": [
+            159.0807,
+            157.9306,
+            157.5344
+          ]
+        }
+      },
+      "has_templates": true,
+      "templatized_rows": 10100,
+      "classic_rows": 0,
+      "stats": {
+        "n_vars": 10000,
+        "n_binary": 0,
+        "n_integer": 0,
+        "n_constraints": 10100,
+        "nnz": 1010000
+      },
+      "construct_speedup": 32.252,
+      "classic_coherent_ms": 1982.385,
+      "phase2_build_to_solver_ms": 1193.764,
+      "phase3_build_to_solver_ms": 178.556,
+      "end_to_end_vs_classic": 11.102,
+      "end_to_end_vs_phase2": 6.686,
+      "peak_rss_mb": 267.62
+    },
+    {
+      "backend": "pyomo_template",
+      "model": "resource_coupling",
+      "size": "1e6",
+      "params": {
+        "Z": 100,
+        "J": 100
+      },
+      "repeats": 3,
+      "warmup": 1,
+      "ok": true,
+      "error": null,
+      "stages": {
+        "construct_off": {
+          "name": "construct_off",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 631.3667290087324,
+          "median_ms": 637.0189040026162,
+          "mean_ms": 636.0924783317993,
+          "stdev_ms": 3.5414606874641903,
+          "samples_ms": [
+            639.8918,
+            637.0189,
+            631.3667
+          ]
+        },
+        "construct_on": {
+          "name": "construct_on",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 18.162512977141887,
+          "median_ms": 18.361483002081513,
+          "mean_ms": 19.17394565922829,
+          "stdev_ms": 1.2922442813605344,
+          "samples_ms": [
+            20.9978,
+            18.1625,
+            18.3615
+          ]
+        },
+        "load_highs": {
+          "name": "load_highs",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 1327.1126479958184,
+          "median_ms": 1329.0839359979145,
+          "mean_ms": 1336.701372327904,
+          "stdev_ms": 12.193180269961072,
+          "samples_ms": [
+            1329.0839,
+            1327.1126,
+            1353.9075
+          ]
+        },
+        "fastload_off": {
+          "name": "fastload_off",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 530.4126940027345,
+          "median_ms": 530.8464230038226,
+          "mean_ms": 531.8570323385453,
+          "stdev_ms": 1.7449176218167806,
+          "samples_ms": [
+            530.4127,
+            530.8464,
+            534.312
+          ]
+        },
+        "fastload_on": {
+          "name": "fastload_on",
+          "repeats": 3,
+          "warmup": 1,
+          "min_ms": 149.75241999491118,
+          "median_ms": 151.5325980144553,
+          "mean_ms": 151.3469916729567,
+          "stdev_ms": 1.2331925870168818,
+          "samples_ms": [
+            149.7524,
+            152.756,
+            151.5326
+          ]
+        }
+      },
+      "has_templates": true,
+      "templatized_rows": 10100,
+      "classic_rows": 0,
+      "stats": {
+        "n_vars": 10000,
+        "n_binary": 0,
+        "n_integer": 0,
+        "n_constraints": 10100,
+        "nnz": 1010000
+      },
+      "construct_speedup": 34.693,
+      "classic_coherent_ms": 1966.103,
+      "phase2_build_to_solver_ms": 1167.865,
+      "phase3_build_to_solver_ms": 169.894,
+      "end_to_end_vs_classic": 11.573,
+      "end_to_end_vs_phase2": 6.874,
+      "peak_rss_mb": 259.57
+    }
+  ],
+  "complete": true
+}

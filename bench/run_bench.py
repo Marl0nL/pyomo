@@ -52,19 +52,23 @@ from bench.harness import timing, sysinfo  # noqa: E402
 def _pyomo_models() -> Dict[str, Any]:
     from bench.models import (
         network_flow,
+        flow_masked,
         unit_commitment,
         facility_location,
         supply_chain,
         resource_coupling,
+        coupling_filtered,
         columnar_stress,
     )
 
     reg = {
         "network_flow": network_flow,
+        "flow_masked": flow_masked,
         "unit_commitment": unit_commitment,
         "facility_location": facility_location,
         "supply_chain": supply_chain,
         "resource_coupling": resource_coupling,
+        "coupling_filtered": coupling_filtered,
         "columnar_stress": columnar_stress,
     }
     return reg
@@ -115,9 +119,11 @@ VECTOR_MODEL_NAMES = ["network_flow", "supply_chain"]
 # fast-path win and the no-slowdown-on-fallback guarantee are on the record.
 TEMPLATE_MODEL_NAMES = [
     "resource_coupling",
+    "coupling_filtered",
     "columnar_stress",
     "facility_location",
     "network_flow",
+    "flow_masked",
     "unit_commitment",
     "supply_chain",
 ]
