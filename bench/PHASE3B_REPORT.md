@@ -173,10 +173,11 @@ Phase-3 report's speedups; the switch-OFF baselines match Phase 3 (65.9 vs 65.8,
 
 ### (c) Equivalence gates — all green, including new shapes
 
-`pyomo/contrib/vector/tests/test_template_vectorize.py` (17 tests) — with the
+`pyomo/contrib/vector/tests/test_template_vectorize.py` (19 tests) — with the
 switch on vs off, the standard form is identical up to row/column permutation with
-the same bounds, checked two ways (the stock compiler on both builds, and the
-vectorized `compile_templated_to_highs_arrays` vs the stock compiler), on:
+the same **signed** nonzeros and bounds, checked two ways (the stock compiler on
+both builds, and the vectorized `compile_templated_to_highs_arrays` vs the stock
+compiler), on:
 
 * `_filtered_sum_model` (`!=`, `<`, and conjunction filters),
 * `_conditional_model` (`(term if pred else const)`, and two independent
@@ -185,6 +186,11 @@ vectorized `compile_templated_to_highs_arrays` vs the stock compiler), on:
   both builds — `len(con)` matches),
 * `_filtered_conditional_model` (the network-flow body shape: filtered sums +
   conditional + sparse arcs + mutable-Param RHS),
+* `_vars_both_filter_model` (variables on **both sides** with a boundary-empty
+  filtered sum — the row orientation is matched per row so the *signed* nonzeros
+  are byte-identical, not merely feasible-set equivalent),
+* `_conditional_diff_vars_model` (conditional branches on **different in-range**
+  variables — pins the polarity routing so a flipped routing bit is caught),
 * the Phase-3 `templatizable` / `mixed` models and **25 randomized** models,
 * **deferrals** (`or` / `not` filters, nested conditionals) — asserted to fall
   back to classic `ConstraintData` **byte-identically**,

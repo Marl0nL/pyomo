@@ -256,6 +256,45 @@ def _random_model(seed):
     return m
 
 
+def _vars_both_filter_model():
+    """Vars on **both sides** of a relation, one side's filter empty for boundary
+    rows (review F1).  Row i=0 has an empty ``j < i`` filter, so classic collapses
+    that side to the constant 0 and re-orients onto the surviving (positive) side;
+    the vectorized path must reproduce that per-row orientation (same *signed*
+    nonzeros), not just the feasible set."""
+    m = pyo.ConcreteModel()
+    m.I = pyo.RangeSet(0, 5)
+    m.x = pyo.Var(m.I, m.I, domain=pyo.NonNegativeReals, bounds=(0, 5))
+    m.eq = pyo.Constraint(
+        m.I,
+        rule=lambda m, i: sum(m.x[i, j] for j in m.I if j < i)
+        == sum(m.x[i, j] for j in m.I if j > i),
+    )
+    m.le = pyo.Constraint(
+        m.I,
+        rule=lambda m, i: sum(m.x[i, j] for j in m.I if j < i)
+        <= sum(m.x[i, j] for j in m.I if j > i),
+    )
+    m.obj = pyo.Objective(expr=sum(m.x[i, j] for i in m.I for j in m.I))
+    return m
+
+
+def _conditional_diff_vars_model():
+    """Conditional whose True / False branches reference **different, in-range**
+    variables (review F2).  A flipped routing bit then produces a valid-but-wrong
+    matrix -- unlike a same-variable / out-of-range branch, which self-heals via
+    the classic fallback and hides the routing error."""
+    m = pyo.ConcreteModel()
+    m.N = pyo.RangeSet(0, 3)
+    m.a = pyo.Var(m.N, domain=pyo.NonNegativeReals, bounds=(0, 5))
+    m.b = pyo.Var(m.N, domain=pyo.NonNegativeReals, bounds=(0, 5))
+    m.c = pyo.Constraint(
+        m.N, rule=lambda m, n: (3.0 * m.a[n] if n < 2 else 7.0 * m.b[n]) <= 4.0
+    )
+    m.obj = pyo.Objective(expr=sum(m.a[n] + m.b[n] for n in m.N))
+    return m
+
+
 def _build(builder, templatized):
     from pyomo.contrib.vector import vectorized_construction
 
@@ -550,6 +589,46 @@ class TestPhase3bCoverage(unittest.TestCase):
                 _range_rows_from_stock(_stock_sf(m_off)),
                 f"compile equivalence failed for {builder.__name__}",
             )
+
+    def test_vars_both_sides_filter_signed_nonzero(self):
+        # Review F1: a vars-both-sides relation whose one side's filtered sum is
+        # empty for a boundary row must be *byte-identical* (same signed nonzeros
+        # and bounds) to the classic standard form -- not merely feasible-set
+        # equivalent.  _range_rows_* carry signed coefficients, so equality here
+        # pins the sign.
+        from pyomo.contrib.vector import compile_templated_to_highs_arrays
+
+        m_on = _build(_vars_both_filter_model, True)
+        m_off = _build(_vars_both_filter_model, False)
+        # not a vacuous pass: the families actually vectorized
+        self.assertTrue(self._templatized(m_on.eq))
+        self.assertTrue(self._templatized(m_on.le))
+        # signed-nonzero equality (the old whole-row sign flip on the empty-filter
+        # boundary rows fails exactly this assertion).
+        self.assertEqual(
+            _range_rows_from_compiled(compile_templated_to_highs_arrays(m_on)),
+            _range_rows_from_stock(_stock_sf(m_off)),
+        )
+        # sanity on the classic side: the i=0 boundary row (lhs filter empty)
+        # re-orients onto the surviving positive side.
+        from pyomo.repn.standard_repn import generate_standard_repn
+
+        repn = generate_standard_repn(m_off.eq[0].body)
+        self.assertTrue(repn.linear_coefs and all(c > 0 for c in repn.linear_coefs))
+
+    def test_conditional_routing_diff_vars(self):
+        # Review F2: a conditional whose branches reference different in-range
+        # variables catches a flipped routing bit (a same-var / out-of-range
+        # model self-heals via fallback and hides the error).
+        from pyomo.contrib.vector import compile_templated_to_highs_arrays
+
+        m_on = _build(_conditional_diff_vars_model, True)
+        m_off = _build(_conditional_diff_vars_model, False)
+        self.assertTrue(self._templatized(m_on.c))
+        self.assertEqual(
+            _range_rows_from_compiled(compile_templated_to_highs_arrays(m_on)),
+            _range_rows_from_stock(_stock_sf(m_off)),
+        )
 
     def test_deferrals_fall_back_byte_identical(self):
         # Predicates outside the proven subset must fall back to classic,

@@ -737,6 +737,16 @@ def extract_family(con, col_offset, mappers, template_info=None, index_list=None
     row_ids = np.arange(n, dtype=np.int64)
 
     ex = _FamilyExtractor(con, col_offset, mappers)
+    # ``flip`` (Phase-3b fix for the vars-both-sides case): rows whose structural
+    # left/first variable side has *no* surviving term (e.g. its filtered sum is
+    # empty for that row) must match classic's per-row orientation.  Classic
+    # evaluates the rule per index, so on those rows the empty side collapses to
+    # the constant ``0`` and the constraint re-orients onto the surviving
+    # (positive) side; a uniform ``lhs - rhs`` orientation would sign-flip
+    # exactly those rows.  We record them here and negate them at assembly (a
+    # whole-row scaling by -1: negate the nonzeros and map ``(lb, ub) ->
+    # (-ub, -lb)``), which reproduces the classic standard form byte-for-byte.
+    flip = None
 
     if isinstance(expr, rel.EqualityExpression):
         lhs, rhs = expr.args
@@ -751,9 +761,10 @@ def extract_family(con, col_offset, mappers, template_info=None, index_list=None
             c_bound = _as_row_array(ex.walk(bound, 1.0, row_axis, row_ids, [], []), n)
             rhs_val = c_bound - c_body
         else:
-            c_lhs = _as_row_array(ex.walk(lhs, 1.0, row_axis, row_ids, [], []), n)
-            c_rhs = _as_row_array(ex.walk(rhs, -1.0, row_axis, row_ids, [], []), n)
+            c_lhs, has_lhs = _walk_side(ex, lhs, 1.0, row_axis, row_ids, n)
+            c_rhs, has_rhs = _walk_side(ex, rhs, -1.0, row_axis, row_ids, n)
             rhs_val = -(c_lhs + c_rhs)
+            flip = (~has_lhs) & has_rhs
         row_lb = rhs_val.copy()
         row_ub = rhs_val.copy()
     elif isinstance(expr, rel.InequalityExpression):
@@ -775,10 +786,11 @@ def extract_family(con, col_offset, mappers, template_info=None, index_list=None
             row_lb = np.full(n, _ninf)
         else:
             # variables on both sides: lhs - rhs <= 0
-            c_lhs = _as_row_array(ex.walk(lhs, 1.0, row_axis, row_ids, [], []), n)
-            c_rhs = _as_row_array(ex.walk(rhs, -1.0, row_axis, row_ids, [], []), n)
+            c_lhs, has_lhs = _walk_side(ex, lhs, 1.0, row_axis, row_ids, n)
+            c_rhs, has_rhs = _walk_side(ex, rhs, -1.0, row_axis, row_ids, n)
             row_ub = -(c_lhs + c_rhs)
             row_lb = np.full(n, _ninf)
+            flip = (~has_lhs) & has_rhs
     elif isinstance(expr, rel.RangedExpression):
         lb_node, body, ub_node = expr.args
         c_body = _as_row_array(ex.walk(body, 1.0, row_axis, row_ids, [], []), n)
@@ -797,7 +809,29 @@ def extract_family(con, col_offset, mappers, template_info=None, index_list=None
         rows = np.zeros(0, np.int64)
         cols = np.zeros(0, np.int64)
         data = np.zeros(0)
+
+    if flip is not None and flip.any():
+        data = np.where(flip[rows], -data, data)
+        row_lb, row_ub = (
+            np.where(flip, -row_ub, row_lb),
+            np.where(flip, -row_lb, row_ub),
+        )
     return rows, cols, data, row_lb, row_ub, n
+
+
+def _walk_side(ex, node, sign, row_axis, row_ids, n):
+    """Walk one relation side; return ``(const_array, has_var_row_mask)``.
+
+    ``has_var_row_mask`` marks the rows that gained at least one variable term
+    from this side -- used to orient the vars-both-sides case per row (a side
+    whose filtered sum is empty for a row contributes no term there).
+    """
+    start = len(ex.rows)
+    const = _as_row_array(ex.walk(node, sign, row_axis, row_ids, [], []), n)
+    has_var = np.zeros(n, dtype=bool)
+    for rr in ex.rows[start:]:
+        has_var[rr] = True
+    return const, has_var
 
 
 def _eval_bound(node, row_axis, n):
@@ -1113,6 +1147,7 @@ def _extract_or_classic(con, col_offset, mappers, n_var):
         return _classic_family(con, col_offset, mappers, n_var)
     A = scipy.sparse.coo_array((data, (rows, cols)), shape=(nr, n_var)).tocsr()
     A.sum_duplicates()
+    A.eliminate_zeros()
     meta = [(con, r) for r in range(nr)]
     return A, lb, ub, meta
 
@@ -1165,6 +1200,7 @@ def _extract_masked_family(con, col_offset, mappers, n_var, masked):
             (data, (rows, cols)), shape=(nr, n_var)
         ).tocsr()
         A_sub.sum_duplicates()
+        A_sub.eliminate_zeros()
         A_parts.append(A_sub)
         lb_parts.append(lb)
         ub_parts.append(ub)
@@ -1223,6 +1259,7 @@ def _classic_family(con, col_offset, mappers, n_var):
         )
     )
     A.sum_duplicates()
+    A.eliminate_zeros()
     return A, np.asarray(lb_l), np.asarray(ub_l), meta
 
 
